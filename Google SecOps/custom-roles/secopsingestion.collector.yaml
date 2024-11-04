@@ -1,0 +1,4 @@
+title: SecOps Ingestion Collector
+description: SecOps Ingestion Collector.
+includedPermissions:
+- chronicle.logs.import
