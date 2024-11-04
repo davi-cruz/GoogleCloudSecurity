@@ -16,5 +16,5 @@ gcloud config set project <project-id>
 - Create the custom role
 
 ```bash
-gcloud iam roles create secopsingestion.collector --file=secopsingestion.collector.yaml
+gcloud iam roles create <role-name> --file=<path-to-the-role-file>.yaml
 ```
