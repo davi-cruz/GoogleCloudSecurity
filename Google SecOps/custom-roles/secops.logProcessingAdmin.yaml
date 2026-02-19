@@ -1,0 +1,18 @@
+title: SecOps Log Processing Admin
+description: SecOps Log Processing Admin.
+includedPermissions:
+- chronicle.feeds.get
+- chronicle.feeds.list
+- chronicle.logProcessingPipelines.associateStreams
+- chronicle.logProcessingPipelines.create
+- chronicle.logProcessingPipelines.delete
+- chronicle.logProcessingPipelines.dissociateStreams
+- chronicle.logProcessingPipelines.fetchAssociatedPipeline
+- chronicle.logProcessingPipelines.fetchSampleLogsByStreams
+- chronicle.logProcessingPipelines.get
+- chronicle.logProcessingPipelines.list
+- chronicle.logProcessingPipelines.testPipeline
+- chronicle.logProcessingPipelines.update
+- chronicle.logTypes.get
+- chronicle.logTypes.list
+- chronicle.logs.list

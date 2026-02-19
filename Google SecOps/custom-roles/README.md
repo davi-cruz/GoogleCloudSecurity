@@ -2,6 +2,7 @@
 
 As described in [Create and manage custom roles | IAM Documentation | Google Cloud](https://cloud.google.com/iam/docs/creating-custom-roles#gcloud) here's a list of custom roles that you can use in your SecOps deployment, ensuring the least privilege principle:
 - `roles/secopsingestion.collector`: GCP role containing only the `chronicle.logs.import` permission, useful for ingestion scripts or the use with bindplane agent configuration
+- `roles/secops.logProcessingAdmin`: GCP role containing only required permissions to Bindplane SecOps LogProcessing Pipeline configuration, as described in [Set up and manage data processing pipelines | Google Security Operations ](https://docs.cloud.google.com/chronicle/docs/ingestion/data-processing-pipeline).
 
 ## Deployment
 
