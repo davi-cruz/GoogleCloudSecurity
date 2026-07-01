@@ -24,26 +24,43 @@ This solution is designed to alert on ingestion pipeline outages, track parsed e
 
 ---
 
-## 1. Compliance Alignment: OMB M-21-31
+## 1. Architectural Rationale: Leveraging Google's Native Infrastructure Telemetry
+
+This solution is designed to leverage Google's robust, enterprise-grade cloud infrastructure monitoring platform (**Google Cloud Monitoring**) to oversee your ingestion pipeline health, rather than relying on duplicate, in-SIEM analytics monitoring layers.
+
+By utilizing Google's native, dedicated metrics engine, the solution provides an efficient and highly resilient architecture for security telemetry monitoring:
+
+```
++-------------------------------------------------------------------------------+
+|                            GOOGLE SECOPS CONSOLE                              |
+|                                                                               |
+|  +------------------------+                    +---------------------------+  |
+|  |     Custom Dashboards  |                    |      SOAR Alert Queue     |  |
+|  |  (YARA-L Ingestion)    |                    |  - Outage alerts queue    |  |
+|  +------------------------+                    +---------------------------+  |
+|               ^ (queries metrics)                            ^                |
++---------------|----------------------------------------------|----------------+
+                |                                              | (webhooks)
++------------------------------------+           +-------------+-------------+
+|    Cloud Monitoring API (BYOP)     | <-------- |    Orchestration Project  |
+|   - Outage / Absence Detection     |           |    - Python SLA engine    |
++------------------------------------+           +---------------------------+
+```
+
+### Strategic Benefits of This Architecture:
+1.  **Platform Efficiency**: Monitoring alerts are evaluated by a dedicated, low-latency infrastructure telemetry layer. Outages and ingestion anomalies are flagged in minutes without placing analytical load on your SIEM indexing or threat hunting engines.
+2.  **No Duplicate Agents or Pipelines**: Instead of deploying secondary collectors or configurations to query status, the solution queries native system metrics generated automatically by the platform's API gateways, forwarders, and normalizers.
+3.  **Consolidated Analyst Workflow**: Operational signals are fully unified within the analyst's day-to-day workspace:
+    *   **SOAR Incident Management**: Outage alerts are pushed via webhook directly to the **Google SecOps SOAR Alert Queue**, allowing security teams to manage and track collection issues using standard playbook workflows.
+    *   **Consolidated Dashboards**: Historical log volumes, ingestion limits, and parsing errors are tracked inside **Google SecOps Custom Dashboards** using YARA-L 2.0 queries on the native `ingestion` metrics schema.
+
+---
+
+## 2. Compliance Alignment: OMB M-21-31
 This solution satisfies the event logging (EL) requirements outlined in the White House Office of Management and Budget (OMB) Memorandum **M-21-31**:
 *   **EL1 (Basic)**: Implements metric-absence alerts to guarantee continuous syslog, agent, and api data flows.
 *   **EL2 (Intermediate)**: Tracks parsing and normalization health ratio rates to maintain UDM schema compliance.
 *   **EL3 (Advanced)**: Routes alerts directly to SOAR playbooks for automated remediation.
-
----
-
-## 2. Solution Architecture & Key Metrics
-
-The architecture uses a unified, low-churn approach:
-*   **Engine Profiler Script (Python)**: Queries the GCP Metrics API to calculate volume patterns, suggests SLA groupings, and auto-provisions Terraform.
-*   **Alert Policies**: Defined natively in **Google Cloud Monitoring** (BYOP project).
-*   **Visualizations**: Built natively inside **Google SecOps Custom Dashboards** using YARA-L queries on the `ingestion` (Ingestion Metrics) schema.
-*   **SOAR Integration**: Routes Cloud Monitoring alerts via Webhook into Google SecOps SOAR.
-
-### Project Separation (BYOP vs. Orchestration)
-To support separate billing accounts and access control models, the architecture is split across two projects:
-1.  **BYOP Project (`byop_project_id`)**: The Google Cloud project where Google SecOps metrics are stored, and where Monitoring Alert Policies and Notification Channels are deployed.
-2.  **Orchestration Project (`orchestration_project_id`)**: The Google Cloud project housing the orchestration resources, including Google Cloud Storage buckets, Secret Manager secrets, Cloud Run Functions, and Cloud Scheduler triggers.
 
 ---
 
@@ -120,129 +137,153 @@ Alerts are sent as JSON payloads to the SOAR webhook. Map the incoming GCP Monit
 
 ---
 
-## 7. Infrastructure Provisioning via Terraform
+## 7. Step-by-Step GCP Deployment Guide
 
-Unlike manual scripts, the entire serverless orchestration stack (Cloud Run Functions, Cloud Scheduler triggers, Secret Manager secrets, and GCS buckets) is deployed automatically via the Terraform templates.
+This guide walks you through deploying this solution using your terminal. 
 
+> [!TIP]
+> **Recommended Environment: Google Cloud Shell**
+> We recommend executing this deployment directly in **Google Cloud Shell** in the Google Cloud console. Cloud Shell provides a secure Linux environment pre-loaded with the Google Cloud SDK (`gcloud` CLI), Git, and Terraform. 
+> To open Cloud Shell, click the terminal icon in the upper right corner of the Google Cloud console.
+
+### Prerequisites (If running locally instead of Cloud Shell)
+If you decide to deploy from your local system instead of Cloud Shell, verify that these dependencies are installed:
+*   [Google Cloud SDK (gcloud CLI)](https://cloud.google.com/sdk/docs/install)
+*   [Terraform CLI](https://developer.hashicorp.com/terraform/install)
+
+---
+
+### Step 1: Authenticate in Google Cloud
+Open your terminal (or Cloud Shell) and authenticate using your GCP administrative account:
+```bash
+# Log in to your Google Account
+gcloud auth login
+
+# Set application default credentials (enables Terraform to authenticate)
+gcloud auth application-default login
 ```
-                  +----------------------------------------------+
-                  |            Orchestration Project             |
-                  |  +--------------------+                      |
-                  |  |   Secret Manager   | --(webhook url)      |
-                  |  +--------------------+         |            |
-                  |  | GCS Config/Deploy  |         |            |
-                  |  +---------+----------+         |            |
-                  |            | (deploys)          v            |
-                  |  +---------v----------+   +------------+     |
-                  |  | Cloud Run Function |-->| Scheduler  |     |
-                  |  +--------------------+   +------------+     |
-                  +----------------------------------------------+
-                                |
-                                v (deploys Alert Policies & Channels)
-                  +----------------------------------------------+
-                  |                 BYOP Project                 |
-                  |  +--------------------+                      |
-                  |  |   Alert Policies   |                      |
-                  |  +--------------------+                      |
-                  +----------------------------------------------+
+
+---
+
+### Step 2: Identify your GCP Project IDs
+You will need two GCP project IDs:
+1.  **BYOP Project ID**: The project provided by Google for your SecOps instance (houses metrics data).
+2.  **Orchestration Project ID**: A project you control where the serverless billing metrics and engines run. *(This can be the same as your BYOP project if you do not require project separation)*.
+
+Configure the orchestration project as your default CLI workspace:
+```bash
+gcloud config set project <YOUR_ORCHESTRATION_PROJECT_ID>
 ```
 
-### 1. Variables & Project Configurations
-Edit `terraform/terraform.tfvars.json` to define the target projects:
+---
+
+### Step 3: Store Webhook URL securely in Secret Manager
+Store your target Google SecOps SOAR Webhook URL inside Secret Manager. Run this command:
+```bash
+# 1. Enable Secret Manager API in your Orchestration Project
+gcloud services enable secretmanager.googleapis.com
+
+# 2. Create the secret container resource
+gcloud secrets create secops-soar-webhook-url --replication-policy="automatic"
+
+# 3. Add the Webhook URL value (replace URL with your target SOAR Webhook URL)
+echo -n "https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring" | \
+  gcloud secrets versions add secops-soar-webhook-url --data-file=-
+```
+
+---
+
+### Step 4: Enable Required Cloud Services
+Enable the serverless, storage, and scheduling APIs in your **Orchestration Project**:
+```bash
+gcloud services enable \
+  cloudfunctions.googleapis.com \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  cloudscheduler.googleapis.com \
+  storage.googleapis.com
+```
+
+---
+
+### Step 5: Configure the Deployment Variables
+Navigate to the `terraform` folder and edit the `terraform.tfvars.json` file. Provide your parameters:
+
 ```json
 {
-  "byop_project_id": "my-secops-byop-project",
-  "orchestration_project_id": "my-secops-orchestration-project",
+  "byop_project_id": "<YOUR_BYOP_PROJECT_ID>",
+  "orchestration_project_id": "<YOUR_ORCHESTRATION_PROJECT_ID>",
   "region": "us-central1",
   "soar_webhook_url": "https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring",
   "contract_terms_json": "[\n  {\n    \"start_date\": \"2026-01-01T00:00:00Z\",\n    \"end_date\": \"2026-12-31T23:59:59Z\",\n    \"committed_gb\": 365000.0\n  }\n]"
 }
 ```
 
-### 2. Required IAM Permissions for Deployment
-The deployment engineer or CI/CD Service Account requires the following permissions:
-*   **On the Orchestration Project**:
-    *   `roles/secretmanager.admin` (to configure Webhook secret storage).
-    *   `roles/storage.admin` (to create deployment/config buckets).
-    *   `roles/cloudfunctions.developer` & `roles/run.developer` (to deploy serverless routines).
-    *   `roles/cloudscheduler.admin` (to create cron scheduler jobs).
-    *   `roles/iam.serviceAccountAdmin` (to create the function's runtime service account).
-*   **On the BYOP Project**:
-    *   `roles/monitoring.editor` (to deploy Alert Policies and Webhook Channels).
+*   **byop_project_id**: Project where Alert Policies are written.
+*   **orchestration_project_id**: Project where GCS buckets, Secret Manager, Cloud Run Functions, and Scheduler are deployed.
+*   **contract_terms_json**: The timeline of committed daily/yearly volumes for overage forecasting (represented as a serialized JSON string). 
+    > [!NOTE]
+    > If you do not have your contract details (committed GB pools or term dates) handy, **please reach out to your Google Cloud Representative or Account Team** to retrieve the exact allocations.
 
 ---
 
-## 8. Secrets & State Governance
+### Step 6: Bootstrap Ingestion Metrics (Dry-Run Check)
+Before deploying, it is best practice to run the scripts in a Python Virtual Environment (`venv` or `uv`) to verify that your credentials can query Google Cloud Monitoring metrics:
 
-### 1. Secret Manager Integration
-The `soar_webhook_url` is stored securely inside Secret Manager on the orchestration project (`secops-soar-webhook-url`). During deployment, Terraform fetches the secret version dynamically using the `google_secret_manager_secret_version` data source and maps it to the BYOP Project's Notification Channel. This ensures the integration token is never written in plaintext within state files.
+#### Option A: Using Python standard `venv`
+```bash
+# 1. Create virtual environment
+python3 -m venv venv
 
-### 2. GCS State Store
-To prevent concurrent state modifications and secure your state history, use a remote **GCS backend** instead of local files. Update `terraform/main.tf` by uncommenting the backend block:
-```hcl
-terraform {
-  backend "gcs" {
-    bucket  = "my-company-secops-tfstate"
-    prefix  = "terraform/secops-monitoring/state"
-  }
-}
+# 2. Activate virtual environment
+source venv/bin/activate
+
+# 3. Install required Python libraries
+pip3 install -r ../scripts/requirements.txt
+
+# 4. Run the profiler dry run (replace project ID with your BYOP Project ID)
+python3 ../scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run
+```
+
+#### Option B: Using `uv` (recommended for faster setup)
+```bash
+# 1. Create and activate virtual environment
+uv venv
+source .venv/bin/activate
+
+# 2. Install dependencies and run the dry run
+uv pip install -r ../scripts/requirements.txt
+python3 ../scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run
+```
+*If successful, this will output a markdown list of all log feeds detected in the environment and their SLA thresholds.*
+
+To update the default variables file before initial provisioning, run:
+```bash
+python3 ../scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID>
+```
+*(Remember to deactivate your virtual environment afterwards using the `deactivate` command).*
+
+---
+
+### Step 7: Provision via Terraform
+Deploy the alerting policies and serverless schedulers to GCP:
+```bash
+# 1. Initialize Terraform plugins
+terraform init
+
+# 2. Review the plan changes to verify both project targets
+terraform plan
+
+# 3. Apply changes (deploys alerting rules to BYOP and serverless triggers to Orchestration)
+terraform apply -auto-approve
 ```
 
 ---
 
-## 9. Implementation, Validation & Dry-Run Guides
-
-Before deploying configurations, use the built-in **Dry Run** flag to evaluate calculations directly inside your terminal in markdown or HTML formats.
-
-### 1. Profiler Dry Run
-Queries Cloud Monitoring API and prints the suggested SLA window configurations as a markdown table:
-```bash
-# Run local dry run
-python3 scripts/run_profiler.py my-secops-byop-project --dry-run --format markdown
-```
-
-#### Output Example:
-| Log Type | SLA Profile | Alert Window (sec) | Daily Avg Logs | Volume Threshold |
-| :--- | :--- | :--- | :--- | :--- |
-| **CROWDSTRIKE_EDR** | realtime | 300 | 540301 | 54030 |
-| **GCP_CLOUDTRAIL** | near_realtime | 1200 | 120401 | 12040 |
-| **WINDOWS_DNS** | batch | 7200 | 25032 | 2503 |
-
-### 2. Consumption Forecast Engine Dry Run (Multi-Year Contract Verification)
-Queries current log metrics since the active contract term and projects overage:
-```bash
-# Point to the multi-year config file directly for terminal dry-run review
-python3 scripts/forecast_engine.py \
-  my-secops-byop-project \
-  --terms-file scripts/contract_terms.json \
-  --dry-run --format markdown
-```
-
-#### Output Example:
-**Active Contract Term:** Year 1 of 3
-
-| Parameter | Value |
-| :--- | :--- |
-| **Calculated At** | 2026-07-01T12:00:00Z |
-| **Active Term Range** | 2026-01-01T00:00:00Z to 2026-12-31T23:59:59Z (181 days elapsed, 184 remaining) |
-| **Committed License Volume** | 365000.0 GB |
-| **Cumulative Ingested** | 210403.5 GB (57.64% of active quota) |
-| **Ideal Target Volume** | 181000.0 GB (49.58% of term) |
-| **Projected Volume (Term End)** | 424218.42 GB |
-| **Estimated Overage** | **59218.42 GB** |
-
-### 3. Simulating an Ingestion Outage Alert
-To verify that absence alerts trigger and route correctly to your notification channel, simulate an outage:
-1.  Temporarily lower the absence threshold for a specific feed (e.g., set `alert_window_seconds = 60` for a test feed) inside `terraform.tfvars.json`.
-2.  Run `terraform apply` to deploy the change.
-3.  Stop sending test logs to that stream for 1 minute.
-4.  Monitor the Cloud Monitoring console to ensure the policy transitions to the **Firing** state.
-5.  Revert the threshold window and redeploy `terraform apply`.
-
-### 4. Webhook Payload & Ontology Verification
-Verify that the payload structure integrates correctly with Google SecOps SOAR:
-1.  Go to the **Google Cloud Monitoring console > Alerting > Notification Channels**.
-2.  Select your Webhook Gateway channel and click **Send Test Connection**.
-3.  Inside your Google SecOps SOAR console, open **Incoming Webhooks Log** and verify:
-    *   The connection payload was received successfully.
-    *   Ontology mappings mapped `policy_name` to `source_rule` and timestamps correctly parsed.
+## 11. Customization & Adjustments
+*   **Adjusting SLA Thresholds**: To manually override a feed's SLA window (e.g. increase an Azure feed's absence alert threshold to 12 hours), edit the corresponding entry block in `terraform.tfvars.json` and redeploy.
+*   **Managing Exclusions**: If a test collector or log type triggers false positive alerts, exclude it inside `terraform/main.tf` by appending filter rules (e.g. `AND metric.labels.log_type != "DUMMY_SOURCE"`).
+*   **Manual Trigger**: You can trigger the SLA profiling script immediately from the GCP Console (Cloud Functions page) or by running the weekly Cloud Scheduler job manually using:
+    ```bash
+    gcloud scheduler jobs run secops-profiler-weekly-trigger --location=us-central1
+    ```
