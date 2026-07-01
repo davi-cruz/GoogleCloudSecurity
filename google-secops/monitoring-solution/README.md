@@ -149,6 +149,32 @@ This JSON represents the mapped output delivered to the SOAR webhook receiver:
 }
 ```
 
+### Google SecOps SOAR Ontology Field Mapping Guide
+
+When configuring the webhook mapping inside the Google SecOps SOAR console, map the keys from the JSON alert payload to the SOAR ontology fields using the following reference table:
+
+#### 1. Mandatory Fields Mapping
+These fields are critical for basic alert indexing and deduplication in the SOAR queue:
+*   **`TicketId`** $\leftarrow$ `soar_alert_id` (e.g., `"incident_30b5e050_7c2b_489d"`). Unique identifier to track the incident.
+*   **`SourceSystemName`** $\leftarrow$ `"Google Cloud Monitoring"`. Hardcoded source tag indicating the metrics origin.
+*   **`Name`** $\leftarrow$ `source_rule` (e.g., `"SecOps Source Silent - WINEVTLOG"`). The alert rule name shown in queues.
+*   **`DeviceVendor`** $\leftarrow$ `"Google Cloud"`. The infrastructure vendor tag.
+*   **`RuleGenerator`** $\leftarrow$ `source_rule` (e.g., `"SecOps Source Silent - WINEVTLOG"`). Identifies the rule generating this alert.
+*   **`StartTime`** $\leftarrow$ `StartTime` (e.g., `1782918400000`). Epoch millisecond timestamp of the incident start window.
+
+#### 2. Advanced / Event Fields Mapping
+These fields enrich the alert event log payload with operational telemetry and priorities:
+*   **`Environment`** $\leftarrow$ `custom_fields.project_id` (e.g., `"my-byop-project"`). Segregates cases based on project boundaries.
+*   **`Description`** $\leftarrow$ `description` (e.g., SOP guidance text block). Standard Operating Procedure and playbook instructions.
+*   **`DisplayId`** $\leftarrow$ `soar_alert_id` (e.g., `"incident_30b5e050_7c2b_489d"`). The display name for alert card headers.
+*   **`Reason`** $\leftarrow$ `Message` (e.g., `"No logs ingested for WINEVTLOG..."`). Summary description explaining the trigger.
+*   **`DeviceProduct`** $\leftarrow$ `product_type` (e.g., `"Google Cloud Monitoring"`). Categorizes the monitoring system tool.
+*   **`EndTime`** $\leftarrow$ `EndTime` (e.g., `1782918700000`). Epoch millisecond timestamp of the incident end window.
+*   **`Priority`** $\leftarrow$ `Severity` (e.g., `"Critical"`). SOAR case prioritization scoring.
+*   **`EventProduct`** $\leftarrow$ `product_type` (e.g., `"Google Cloud Monitoring"`). Maps to the underlying event telemetry category.
+*   **`EventName`** $\leftarrow$ `event_type` (e.g., `"Metric Absence"`). Maps to the specific trigger subcategory.
+*   **`EventsList`** $\leftarrow$ An array version of the `custom_fields` metadata block containing `collector_id`, `log_type`, and `ingestion_source` variables to enable analysts to inspect target assets inside the event panel.
+
 ---
 
 ## 6. Execution Schedules & Maintenance
