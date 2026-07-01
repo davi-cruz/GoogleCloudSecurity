@@ -1,11 +1,28 @@
-variable "project_id" {
+variable "byop_project_id" {
   type        = string
-  description = "The BYOP Google Cloud Project ID where Google SecOps metrics are stored."
+  description = "The BYOP Google Cloud Project ID where Google SecOps metrics are stored and Alert Policies are deployed."
+}
+
+variable "orchestration_project_id" {
+  type        = string
+  description = "The GCP Project ID where the serverless orchestration resources (GCS, Secrets, Cloud Run Function, Scheduler) are deployed."
+}
+
+variable "region" {
+  type        = string
+  description = "GCP Region for the serverless and storage resources."
+  default     = "us-central1"
 }
 
 variable "soar_webhook_url" {
   type        = string
-  description = "The target Webhook URL for Google SecOps SOAR."
+  description = "The target Webhook URL for Google SecOps SOAR. Stored securely in Secret Manager."
+}
+
+variable "contract_terms_json" {
+  type        = string
+  description = "Serialized JSON string of the multi-year contract term list."
+  default     = "[]"
 }
 
 variable "monitors" {
