@@ -6,6 +6,17 @@ terraform {
       version = ">= 4.0.0"
     }
   }
+
+  # --- RECOMMENDED PRODUCTION STATE STORAGE CONFIGURATION ---
+  # To use a remote Google Cloud Storage bucket for storing terraform state (tfstate):
+  # 1. Create a GCS bucket (e.g. gs://my-company-secops-tfstate).
+  # 2. Enable object versioning on the GCS bucket for backup safety.
+  # 3. Uncomment the block below and replace bucket name.
+  #
+  # backend "gcs" {
+  #   bucket  = "my-company-secops-tfstate"
+  #   prefix  = "terraform/secops-monitoring/state"
+  # }
 }
 
 provider "google" {

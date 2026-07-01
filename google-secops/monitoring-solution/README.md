@@ -53,7 +53,7 @@ The architecture uses a unified, low-churn approach:
 
 The solution generates the following primary alerts:
 
-1.  **Log Ingestion Absence (Per Source)**: Triggers when no log records are ingested for a source (e.g. `WINDOWS_DNS`) for longer than its calculated SLA window (e.g. 5m for realtime, 12h for variable).
+1.  **Log Ingestion Absence (Per Source)**: Triggers when no log records are ingested for a source (e.g. `WINDOWS_DNS`) for longer than its designated SLA window (e.g. 5m for realtime, 12h for variable).
 2.  **Silent Endpoint Host**: Alerts if a specific server host ceases sending logs, while the gateway agent remains online. (Requires Bindplane to copy `host.name` to the `ingestion_source` label).
 3.  **Active-Passive HA Outage**: Alerts only when *all* redundant cluster members (e.g. `prod-fw-1` and `prod-fw-2`) stop sending data simultaneously.
 4.  **Parser/Normalization Failure**: Alerts if parsing errors rise to $\ge 5\%$ of total logs in a 15-minute window, identifying vendor format shifts or broken parsers.
@@ -122,43 +122,127 @@ Alerts are sent as JSON payloads to the SOAR webhook. Map the incoming GCP Monit
 
 ---
 
-## 7. Required Permissions & Deployment Steps
+## 7. Production Deployment: Cloud Run Functions & Scheduler
 
-### IAM Permissions Required
-Deploying and running this monitoring solution requires:
-1.  **For Terraform Deployment**:
-    *   `roles/monitoring.editor` (to create alert policies and notification channels).
-2.  **For Script Executions (Profiler / Drift Detection / Forecast)**:
-    *   `roles/monitoring.viewer` (to read metric time series data).
+In a production environment, running Python scripts on local machines is discouraged. Instead, deploy the scripts as serverless **Cloud Run Functions** (previously Cloud Functions Gen 2) orchestrated by **Cloud Scheduler**.
 
-### Deployment Instructions
-
-#### Step 1: Initialize Terraform
-Configure the backend in your Terraform root and run:
-```bash
-cd terraform/
-terraform init
+```
++-----------------+                      +---------------------+
+| Cloud Scheduler | --(HTTP trigger)-->  | Cloud Run Function  |
+| (Weekly Cron)   |                      | (SLA Engine/Python) |
++-----------------+                      +----------+----------+
+                                                    |
+                                                    v (writes variables)
++-----------------+                      +----------+----------+
+|   Cloud Build   | <---(triggers)------ | GCS Config Bucket   |
+| (Terraform Apply)                      | (tfvars.json)       |
++-----------------+                      +---------------------+
 ```
 
-#### Step 2: Configure the Variables
-Edit `terraform.tfvars.json` to define your target `project_id` and the `soar_webhook_url` pointing to your SOAR gateway.
+### 1. Environment Variables Configuration
+Configure the following env variables on your Cloud Run Functions:
 
-#### Step 3: Run the Ingestion Profiler
-Bootstrap your variables dynamically:
+| Variable Name | Required By | Description | Example Value |
+| :--- | :--- | :--- | :--- |
+| `GCP_PROJECT_ID` | All scripts | The GCP project housing your BYOP SecOps metrics. | `my-secops-byop-project` |
+| `OUTPUT_GCS_BUCKET` | Profiler / Forecast | The GCS bucket where output configuration files are written. | `my-company-secops-configs` |
+| `OUTPUT_GCS_BLOB` | Profiler | Filename for the output Terraform variables JSON file. | `terraform.tfvars.json` |
+| `COMMITTED_GB` | Forecast | Your contracted committed log volume (in Gigabytes) for the term. | `365000` |
+| `CONTRACT_START` | Forecast | Start of the contract term (ISO format). | `2026-01-01T00:00:00Z` |
+| `CONTRACT_END` | Forecast | End of the contract term (ISO format). | `2026-12-31T23:59:59Z` |
+
+### 2. IAM Service Account Permissions
+The Service Account assigned to the Cloud Run Functions must possess the following IAM roles:
+*   `roles/monitoring.viewer`: Permitted to query Cloud Monitoring metric time-series data.
+*   `roles/storage.objectAdmin`: Permitted to write and update configuration files in the GCS config bucket.
+
+### 3. Deploying as a Cloud Run Function (Command Line)
+Deploy the SLA Profiler using the `gcloud` CLI:
 ```bash
-python3 ../scripts/run_profiler.py <GCP_PROJECT_ID>
+gcloud functions deploy secops-sla-profiler \
+  --gen2 \
+  --runtime=python310 \
+  --region=us-central1 \
+  --main-http-entrypoint=main \
+  --source=./scripts \
+  --set-env-vars GCP_PROJECT_ID=my-secops-byop-project,OUTPUT_GCS_BUCKET=my-company-secops-configs \
+  --trigger-http \
+  --no-allow-unauthenticated
 ```
-*This will query the metrics API and overwrite the `monitors` configuration block in `terraform/terraform.tfvars.json` with the P95 SLA values.*
+*(Ensure you modify your Python scripts' code to act as an HTTP endpoint by accepting `request` parameter as required by the Functions framework).*
 
-#### Step 4: Apply the Alerts Infrastructure
-Deploy the policies:
+### 4. Configuring Cloud Scheduler (Weekly SLA Profiler Trigger)
+Schedule the Cloud Run function to trigger every Sunday night at midnight:
 ```bash
-terraform plan
-terraform apply -auto-approve
+gcloud scheduler jobs create http trigger-secops-profiler \
+  --schedule="0 0 * * 0" \
+  --uri="https://us-central1-my-project.cloudfunctions.net/secops-sla-profiler" \
+  --http-method=POST \
+  --oidc-service-account-email="secops-function-sa@my-project.iam.gserviceaccount.com" \
+  --location=us-central1
 ```
 
 ---
 
-## 8. Customization & Adjustments
-*   **Adjusting SLA Thresholds**: To manually override a feed's SLA window (e.g. increase an Azure feed's absence alert threshold to 12 hours), edit the corresponding entry block in `terraform.tfvars.json` and redeploy.
-*   **Adding Exclusions**: If a test collector or log type triggers false positive alerts, exclude it inside `terraform/main.tf` by appending filter rules (e.g. `AND metric.labels.log_type != "DUMMY_SOURCE"`).
+## 8. Terraform State Management & CI/CD
+
+### 1. Remote GCS State Store
+To prevent concurrent state modifications and secure your state history, use a remote **GCS backend** instead of local files. Update `terraform/main.tf` by uncommenting the backend block:
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket  = "my-company-secops-tfstate"
+    prefix  = "terraform/secops-monitoring/state"
+  }
+}
+```
+> [!IMPORTANT]
+> Always enable **Object Versioning** on your GCS tfstate bucket to recover state in case of accidental deletions.
+
+### 2. GitOps Automation Trigger (Cloud Build)
+Create a Cloud Build trigger that automatically executes `terraform apply` when a new `terraform.tfvars.json` is written by the profiling script to the GCS configuration bucket:
+
+1.  **Trigger Source**: Cloud Storage bucket (`gs://my-company-secops-configs/terraform.tfvars.json`).
+2.  **Build Steps**:
+    *   Pull Terraform files from your repository.
+    *   Download `terraform.tfvars.json` from GCS.
+    *   Run `terraform init`.
+    *   Run `terraform apply -auto-approve`.
+
+---
+
+## 9. Implementation & Validation Plan
+
+To ensure your alert configurations function as intended, follow this three-phase validation strategy:
+
+```
+[Phase 1: Validation] ---> [Phase 2: Alert Outage Simulation] ---> [Phase 3: Webhook Verification]
+```
+
+### Phase 1: Dry-Running Python Scripts
+Validate that API connections, IAM roles, and GCS write permissions are functional before deploying IaC:
+```bash
+# Run locally using your user credentials to test Metric queries
+export GCP_PROJECT_ID="my-secops-byop-project"
+python3 scripts/run_profiler.py
+
+# Confirm that terraform/terraform.tfvars.json has been correctly updated
+cat terraform/terraform.tfvars.json
+```
+
+### Phase 2: Simulating an Alert Event (Outage Test)
+To verify that absence alerts trigger and route correctly to your notification channel, simulate an outage:
+1.  Temporarily lower the absence threshold for a specific feed (e.g., set `alert_window_seconds = 60` for a test feed) inside `terraform.tfvars.json`.
+2.  Run `terraform apply` to deploy the change.
+3.  Stop sending test logs to that stream for 1 minute.
+4.  Monitor the Cloud Monitoring console to ensure the policy transitions to the **Firing** state.
+5.  Revert the threshold window and redeploy `terraform apply`.
+
+### Phase 3: Webhook Payload & Ontology Verification
+Verify that the payload structure integrates correctly with Google SecOps SOAR:
+1.  Go to the **Google Cloud Monitoring console > Alerting > Notification Channels**.
+2.  Select your Webhook Gateway channel and click **Send Test Connection**.
+3.  Inside your Google SecOps SOAR console, open **Incoming Webhooks Log** and verify:
+    *   The connection payload was received successfully.
+    *   Ontology mappings mapped `policy_name` to `source_rule` and timestamps correctly parsed.
