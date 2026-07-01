@@ -168,7 +168,7 @@ gcloud auth application-default login
 ### Step 2: Identify your GCP Project IDs
 You will need two GCP project IDs:
 1.  **BYOP Project ID**: The project provided by Google for your SecOps instance (houses metrics data).
-2.  **Orchestration Project ID**: A project you control where the serverless billing metrics and engines run. *(This can be the same as your BYOP project if you do not require project separation)*.
+2.  **Orchestration Project ID**: A project you control where the serverless billing metrics and engines run. *(This can be the same as your BYOP project if you do not require project segregation)*.
 
 Configure the orchestration project as your default CLI workspace:
 ```bash
@@ -277,6 +277,130 @@ terraform plan
 # 3. Apply changes (deploys alerting rules to BYOP and serverless triggers to Orchestration)
 terraform apply -auto-approve
 ```
+
+---
+
+## 8. Secret Manager Integration (Secrets Governance)
+
+To comply with enterprise security practices, do not hardcode the `soar_webhook_url` (which contains integration secrets/tokens) in cleartext variables. Use **Secret Manager**:
+
+### 1. Provision the Secret in GCP
+```bash
+# Create the secret holder
+gcloud secrets create secops-soar-webhook-url --replication-policy="automatic"
+
+# Add the webhook URL version payload
+echo -n "https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring" | \
+  gcloud secrets versions add secops-soar-webhook-url --data-file=-
+```
+
+### 2. IAM Permissions for Secrets
+*   **Provisioner Persona**: Needs `roles/secretmanager.admin` to manage the secret infrastructure.
+*   **Terraform Service Account**: Needs `roles/secretmanager.secretAccessor` to retrieve the secret during plan/apply.
+
+### 3. Retrieve Secret version in Terraform
+In your Terraform configuration, fetch the webhook URL dynamically using a data block:
+```hcl
+data "google_secret_manager_secret_version" "soar_webhook" {
+  secret = "secops-soar-webhook-url"
+}
+
+# Map the data version payload to the notification channel
+resource "google_monitoring_notification_channel" "soar_webhook" {
+  display_name = "SecOps SOAR Webhook Gateway"
+  type         = "webhook_tokenauth"
+  labels = {
+    url = data.google_secret_manager_secret_version.soar_webhook.secret_data
+  }
+}
+```
+
+---
+
+## 9. Terraform State Management & CI/CD
+
+### 1. Remote GCS State Store
+To prevent concurrent state modifications and secure your state history, use a remote **GCS backend** instead of local files. Update `terraform/main.tf` by uncommenting the backend block:
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket  = "my-company-secops-tfstate"
+    prefix  = "terraform/secops-monitoring/state"
+  }
+}
+```
+> [!IMPORTANT]
+> Always enable **Object Versioning** on your GCS tfstate bucket to recover state in case of accidental deletions.
+
+### 2. GitOps Automation Trigger (Cloud Build)
+Create a Cloud Build trigger that automatically executes `terraform apply` when a new `terraform.tfvars.json` is written by the profiling script to the GCS configuration bucket:
+
+1.  **Trigger Source**: Cloud Storage bucket (`gs://my-company-secops-configs/terraform.tfvars.json`).
+2.  **Build Steps**:
+    *   Pull Terraform files from your repository.
+    *   Download `terraform.tfvars.json` from GCS.
+    *   Run `terraform init`.
+    *   Run `terraform apply -auto-approve`.
+
+---
+
+## 10. Verification, Validation & Dry-Run Guides
+
+Before deploying configurations, use the built-in **Dry Run** flag to evaluate calculations directly inside your terminal in markdown or HTML formats.
+
+### 1. Profiler Dry Run
+Queries Cloud Monitoring API and prints the suggested SLA window configurations as a markdown table:
+```bash
+# Run local dry run
+python3 scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run --format markdown
+```
+
+#### Output Example:
+| Log Type | SLA Profile | Alert Window (sec) | Daily Avg Logs | Volume Threshold |
+| :--- | :--- | :--- | :--- | :--- |
+| **CROWDSTRIKE_EDR** | realtime | 300 | 540301 | 54030 |
+| **GCP_CLOUDTRAIL** | near_realtime | 1200 | 120401 | 12040 |
+| **WINDOWS_DNS** | batch | 7200 | 25032 | 2503 |
+
+### 2. Consumption Forecast Engine Dry Run (Multi-Year Contract Verification)
+Queries current log metrics since the active contract term and projects overage:
+```bash
+# Point to the multi-year config file directly for terminal dry-run review
+python3 scripts/forecast_engine.py \
+  <YOUR_BYOP_PROJECT_ID> \
+  --terms-file scripts/contract_terms.json \
+  --dry-run --format markdown
+```
+
+#### Output Example:
+**Active Contract Term:** Year 1 of 3
+
+| Parameter | Value |
+| :--- | :--- |
+| **Calculated At** | 2026-07-01T12:00:00Z |
+| **Active Term Range** | 2026-01-01T00:00:00Z to 2026-12-31T23:59:59Z (181 days elapsed, 184 remaining) |
+| **Committed License Volume** | 365000.0 GB |
+| **Cumulative Ingested** | 210403.5 GB (57.64% of active quota) |
+| **Ideal Target Volume** | 181000.0 GB (49.58% of term) |
+| **Projected Volume (Term End)** | 424218.42 GB |
+| **Estimated Overage** | **59218.42 GB** |
+
+### 3. Simulating an Ingestion Outage Alert
+To verify that absence alerts trigger and route correctly to your notification channel, simulate an outage:
+1.  Temporarily lower the absence threshold for a specific feed (e.g., set `alert_window_seconds = 60` for a test feed) inside `terraform.tfvars.json`.
+2.  Run `terraform apply` to deploy the change.
+3.  Stop sending test logs to that stream for 1 minute.
+4.  Monitor the Cloud Monitoring console to ensure the policy transitions to the **Firing** state.
+5.  Revert the threshold window and redeploy `terraform apply`.
+
+### 4. Webhook Payload & Ontology Verification
+Verify that the payload structure integrates correctly with Google SecOps SOAR:
+1.  Go to the **Google Cloud Monitoring console > Alerting > Notification Channels**.
+2.  Select your Webhook Gateway channel and click **Send Test Connection**.
+3.  Inside your Google SecOps SOAR console, open **Incoming Webhooks Log** and verify:
+    *   The connection payload was received successfully.
+    *   Ontology mappings mapped `policy_name` to `source_rule` and timestamps correctly parsed.
 
 ---
 
