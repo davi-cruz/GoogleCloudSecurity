@@ -238,7 +238,7 @@ resource "google_monitoring_alert_policy" "log_feed_absence" {
   conditions {
     display_name = "No records seen for ${each.value.log_type}"
     condition_absent {
-      filter   = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/record_count\" AND metric.labels.log_type = \"${each.value.log_type}\""
+      filter   = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/record_count\" AND resource.labels.log_type = \"${each.value.log_type}\""
       duration = "${each.value.alert_window_seconds}s"
       
       trigger {
@@ -249,7 +249,7 @@ resource "google_monitoring_alert_policy" "log_feed_absence" {
         alignment_period     = "300s"
         per_series_aligner   = "ALIGN_SUM"
         cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "metric.labels.log_type"]
+        group_by_fields      = ["project_id", "resource.labels.log_type"]
       }
     }
   }
@@ -322,7 +322,7 @@ resource "google_monitoring_alert_policy" "parser_degradation" {
         alignment_period     = "300s"
         per_series_aligner   = "ALIGN_SUM"
         cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "metric.labels.log_type"]
+        group_by_fields      = ["project_id", "resource.labels.log_type"]
       }
     }
   }

@@ -56,7 +56,12 @@ def analyze_ingestion_sla(project_id, lookback_days=15):
     log_profiles = {}
 
     for series in results:
-        labels = series.metric.labels
+        labels = {}
+        for k, v in series.resource.labels.items():
+            labels[k] = v
+        for k, v in series.metric.labels.items():
+            labels[k] = v
+            
         log_type = labels.get("log_type", "UNKNOWN")
         if not log_type or log_type == "FORWARDER_HEARTBEAT":
             continue

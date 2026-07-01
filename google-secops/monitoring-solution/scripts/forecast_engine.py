@@ -49,7 +49,7 @@ def calculate_forecast(project_id, active_term, contract_start, contract_end):
     results = client.list_time_series(
         request={
             "name": name,
-            "filter": 'metric.type = "chronicle.googleapis.com/ingestion/log/bytes_count" AND metric.labels.log_type != "FORWARDER_HEARTBEAT"',
+            "filter": 'metric.type = "chronicle.googleapis.com/ingestion/log/bytes_count" AND resource.labels.log_type != "FORWARDER_HEARTBEAT"',
             "interval": interval,
             "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
         }
