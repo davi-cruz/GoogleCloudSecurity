@@ -30,21 +30,17 @@ provider "google" {
 }
 
 # ==============================================================================
-# SECTION A: SECRETS & STORAGE (Orchestration Project)
+# SECTION A: STORAGE & DATA LOOKUPS (Orchestration Project)
 # ==============================================================================
 
-# Create Secret in Secret Manager to hold SOAR Webhook URL
-resource "google_secret_manager_secret" "soar_webhook_url" {
+# Look up pre-existing Secret holding the SOAR Webhook URL (provisioned in Step 3)
+data "google_secret_manager_secret" "soar_webhook_url" {
   secret_id = "secops-soar-webhook-url"
-  replication {
-    automatic = true
-  }
 }
 
-# Save value into Secret Manager
-resource "google_secret_manager_secret_version" "soar_webhook_url_version" {
-  secret      = google_secret_manager_secret.soar_webhook_url.id
-  secret_data = var.soar_webhook_url
+# Fetch the active version of the secret payload
+data "google_secret_manager_secret_version" "soar_webhook_url_version" {
+  secret = data.google_secret_manager_secret.soar_webhook_url.id
 }
 
 # Configuration Bucket to store outputs (e.g. terraform.tfvars.json)
@@ -105,9 +101,9 @@ resource "google_project_iam_member" "storage_admin_orchestration" {
   member  = "serviceAccount:${google_service_account.function_sa.email}"
 }
 
-# Give Service Account access to Secret Manager
+# Give Service Account access to retrieve Webhook secrets dynamically
 resource "google_secret_manager_secret_iam_member" "secret_accessor" {
-  secret_id = google_secret_manager_secret.soar_webhook_url.id
+  secret_id = data.google_secret_manager_secret.soar_webhook_url.id
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.function_sa.email}"
 }
@@ -219,19 +215,13 @@ resource "google_cloud_scheduler_job" "forecast_scheduler" {
 # SECTION D: ALERT POLICIES & NOTIFICATION CHANNELS (BYOP Project)
 # ==============================================================================
 
-# Fetch SOAR Webhook URL dynamically from Secret Manager (to avoid exposing in TF files)
-data "google_secret_manager_secret_version" "soar_webhook" {
-  provider = google
-  secret   = google_secret_manager_secret.soar_webhook_url.secret_id
-}
-
 # Configures the Webhook Notification Channel in the BYOP project
 resource "google_monitoring_notification_channel" "soar_webhook" {
   provider     = google.byop
   display_name = "SecOps SOAR Webhook Gateway"
   type         = "webhook_tokenauth"
   labels = {
-    url = data.google_secret_manager_secret_version.soar_webhook.secret_data
+    url = data.google_secret_manager_secret_version.soar_webhook_url_version.secret_data
   }
   user_labels = {
     target = "secops-soar"

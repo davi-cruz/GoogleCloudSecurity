@@ -262,16 +262,16 @@ Navigate to the `terraform` folder and edit the `terraform.tfvars.json` file. Pr
   "byop_project_id": "<YOUR_BYOP_PROJECT_ID>",
   "orchestration_project_id": "<YOUR_ORCHESTRATION_PROJECT_ID>",
   "region": "us-central1",
-  "soar_webhook_url": "https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring",
   "contract_terms_json": "[\n  {\n    \"start_date\": \"2026-01-01T00:00:00Z\",\n    \"end_date\": \"2026-12-31T23:59:59Z\",\n    \"committed_gb\": 365000.0\n  }\n]"
 }
 ```
 
 *   **byop_project_id**: Project where Alert Policies are written.
-*   **orchestration_project_id**: Project where GCS buckets, Secret Manager, Cloud Run Functions, and Scheduler are deployed.
+*   **orchestration_project_id**: Project where GCS buckets, Cloud Run Functions, and Scheduler are deployed.
 *   **contract_terms_json**: The timeline of committed daily/yearly volumes for overage forecasting (represented as a serialized JSON string). 
     > [!NOTE]
     > If you do not have your contract details (committed GB pools or term dates) handy, **please reach out to your Google Cloud Representative or Account Team** to retrieve the exact allocations.
+    > The Webhook URL is loaded securely from the Secret Manager secret (`secops-soar-webhook-url`) created in Step 3, meaning it does not need to be specified in cleartext variables.
 
 ---
 
@@ -330,36 +330,23 @@ terraform apply -auto-approve
 
 ## 8. Secret Manager Integration (Secrets Governance)
 
-To comply with enterprise security practices, do not hardcode the `soar_webhook_url` (which contains integration secrets/tokens) in cleartext variables. Use **Secret Manager**:
+To comply with enterprise security practices, do not hardcode the webhook URL (which contains integration secrets/tokens) in cleartext variables. 
 
-### 1. Provision the Secret in GCP
-```bash
-# Create the secret holder
-gcloud secrets create secops-soar-webhook-url --replication-policy="automatic"
+As configured in **Step 3**, you store the secret in Secret Manager. During `terraform apply`, Terraform dynamically retrieves the value from Secret Manager to configure the BYOP Project's notification channel, keeping the secret completely out of your local settings or version control systems.
 
-# Add the webhook URL version payload
-echo -n "https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring" | \
-  gcloud secrets versions add secops-soar-webhook-url --data-file=-
-```
-
-### 2. IAM Permissions for Secrets
+### IAM Permissions for Secrets
 *   **Provisioner Persona**: Needs `roles/secretmanager.admin` to manage the secret infrastructure.
 *   **Terraform Service Account**: Needs `roles/secretmanager.secretAccessor` to retrieve the secret during plan/apply.
 
-### 3. Retrieve Secret version in Terraform
+### Retrieve Secret version in Terraform
 In your Terraform configuration, fetch the webhook URL dynamically using a data block:
 ```hcl
-data "google_secret_manager_secret_version" "soar_webhook" {
-  secret = "secops-soar-webhook-url"
+data "google_secret_manager_secret" "soar_webhook_url" {
+  secret_id = "secops-soar-webhook-url"
 }
 
-# Map the data version payload to the notification channel
-resource "google_monitoring_notification_channel" "soar_webhook" {
-  display_name = "SecOps SOAR Webhook Gateway"
-  type         = "webhook_tokenauth"
-  labels = {
-    url = data.google_secret_manager_secret_version.soar_webhook.secret_data
-  }
+data "google_secret_manager_secret_version" "soar_webhook_url_version" {
+  secret = data.google_secret_manager_secret.soar_webhook_url.id
 }
 ```
 
@@ -449,6 +436,33 @@ Verify that the payload structure integrates correctly with Google SecOps SOAR:
 3.  Inside your Google SecOps SOAR console, open **Incoming Webhooks Log** and verify:
     *   The connection payload was received successfully.
     *   Ontology mappings mapped `policy_name` to `source_rule` and timestamps correctly parsed.
+
+To manually trigger and test the webhook endpoint, post the JSON alert payload using the following `curl` command (replace target URL with your SOAR incoming webhook endpoint):
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "StartTime": 1782918400000,
+    "EndTime": 1782918700000,
+    "product_type": "Google Cloud Monitoring",
+    "event_type": "Metric Absence",
+    "soar_alert_id": "incident_30b5e050_7c2b_489d",
+    "detection_time": 1782918400000,
+    "source_rule": "SecOps Source Silent - WINEVTLOG",
+    "source_system_uri": "https://console.cloud.google.com/monitoring/alerting/incidents/incident_30b5e050_7c2b_489d?project=my-byop-project",
+    "Message": "No logs ingested for WINEVTLOG in the last 60 minutes.",
+    "description": "Please review Outage Alert Response SOP located at SOP-URI. Check forwarder and collector health.",
+    "Severity": "Critical",
+    "CategoryOutcome": "open",
+    "custom_fields": {
+      "project_id": "my-byop-project",
+      "collector_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "log_type": "WINEVTLOG",
+      "ingestion_source": "central-syslog-gateway-us"
+    }
+  }' \
+  https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring
+```
 
 ---
 

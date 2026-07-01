@@ -14,11 +14,6 @@ variable "region" {
   default     = "us-central1"
 }
 
-variable "soar_webhook_url" {
-  type        = string
-  description = "The target Webhook URL for Google SecOps SOAR. Stored securely in Secret Manager."
-}
-
 variable "contract_terms_json" {
   type        = string
   description = "Serialized JSON string of the multi-year contract term list."
