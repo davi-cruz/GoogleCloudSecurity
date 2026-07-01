@@ -64,7 +64,7 @@ def analyze_ingestion_sla(project_id, lookback_days=15):
         timestamps = []
         volumes = []
         for point in series.points:
-            timestamps.append(point.interval.end_time.seconds)
+            timestamps.append(int(point.interval.end_time.timestamp()))
             volumes.append(point.value.int64_value)
 
         if not timestamps:
