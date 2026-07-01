@@ -102,7 +102,29 @@ order:
 
 ## 5. Webhook Ontology Payload Mapping
 
-Alerts are sent as JSON payloads to the SOAR webhook. Map the incoming GCP Monitoring fields to the SOAR ontology inside Google SecOps SOAR:
+Alerts are sent as JSON payloads to the SOAR webhook. To ingest Google Cloud Monitoring alerts into Google SecOps SOAR via the webhook connector, the payload must be mapped to SOAR's internal alert and event ontology.
+
+### Webhook JSON Payload Mapping
+Since Google Cloud Monitoring sends a fixed JSON payload structure, mapping must be applied in the SOAR Webhook integration mapper (or via a Cloud Function proxy).
+
+| Google Cloud Monitoring Field | Google SecOps SOAR Ontology Field | Transformation / Logic |
+| :--- | :--- | :--- |
+| `incident.started_at` | `StartTime` | Multiply by 1000 (convert Unix timestamp to epoch ms) |
+| `incident.ended_at` | `EndTime` | Multiply by 1000 (if present; defaults to current epoch ms) |
+| `"Google Cloud Monitoring"` | `product_type` | Hardcoded string literal |
+| `incident.condition_name` | `event_type` | Direct mapping of alert condition type |
+| `incident.incident_id` | `soar_alert_id` | Unique ID mapping for deduplication |
+| `incident.started_at` | `detection_time` | Multiply by 1000 |
+| `incident.policy_name` | `source_rule` | Identifies the monitoring rule triggered |
+| `incident.url` | `source_system_uri` | Direct link to the incident page in GCP Console |
+| `incident.summary` | `Message` | Short descriptive message |
+| `incident.documentation.content` | `description` | Maps the Markdown-formatted SOP documentation |
+| `incident.state` | `CategoryOutcome` | Mapped value (e.g. "open" or "closed") |
+| `incident.scoping_project_id` | `custom_fields["project_id"]` | Dynamic key-value custom field |
+| Resource / Metric Labels | `custom_fields["log_type"]`, etc. | Dynamic fields representing the impacted collector/feed |
+
+### Example SOAR Webhook Ingestion JSON
+This JSON represents the mapped output delivered to the SOAR webhook receiver:
 
 ```json
 {
