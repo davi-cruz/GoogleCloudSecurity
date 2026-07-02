@@ -1,0 +1,6 @@
+.agents/
+venv/
+.venv/
+*.zip
+terraform/forecast_vars.json
+terraform/scripts_deployment.zip
