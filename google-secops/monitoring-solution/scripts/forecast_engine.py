@@ -14,7 +14,43 @@ import time
 from datetime import datetime, timezone
 import functions_framework
 from google.cloud import monitoring_v3
-from google.cloud import storage
+
+from secops_monitoring_utils import send_soar_webhook_alert, write_json_output
+
+def send_webhook_alert(report, webhook_url, project_id):
+    """Sends a SOAR-formatted webhook alert if an ingestion overage is projected."""
+    overage = report.get("projected_overage_gb", 0.0)
+    committed = report.get("committed_volume_gb", 0.0)
+    pct_consumed = report.get("pct_commitment_consumed", 0.0)
+    pct_elapsed = report.get("pct_time_elapsed", 0.0)
+    
+    if overage <= 0 and pct_consumed <= pct_elapsed * 1.15:
+        print("Forecast trajectory within bounds; no overage webhook required.", file=sys.stderr)
+        return
+        
+    severity = "Critical" if overage > 0 else "Warning"
+    message = f"Projected contract overage of {overage} GB. Ingestion consumed {pct_consumed}% of license vs {pct_elapsed}% term elapsed."
+    description = f"Contract term ({report['active_term_start']} to {report['active_term_end']}): Committed {committed} GB, Ingested {report['cumulative_ingestion_gb']} GB. Projected term end volume: {report['projected_total_volume_gb']} GB."
+    
+    custom_fields = {
+        "project_id": project_id,
+        "committed_volume_gb": str(committed),
+        "cumulative_ingestion_gb": str(report['cumulative_ingestion_gb']),
+        "projected_overage_gb": str(overage),
+        "pct_commitment_consumed": str(pct_consumed),
+        "pct_time_elapsed": str(pct_elapsed)
+    }
+    
+    send_soar_webhook_alert(
+        webhook_url=webhook_url,
+        project_id=project_id,
+        event_type="Contract Overage Forecast Warning",
+        source_rule="SecOps Contract Consumption Velocity Warning",
+        message=message,
+        description=description,
+        severity=severity,
+        custom_fields=custom_fields
+    )
 
 def find_active_term(terms):
     """Identifies the contract term active for the current date."""
@@ -94,20 +130,7 @@ def calculate_forecast(project_id, active_term, contract_start, contract_end):
 
 def write_forecast_report(report, filepath, gcs_bucket=None, gcs_blob_name=None):
     """Writes forecast output to local file or GCS bucket."""
-    json_content = json.dumps(report, indent=2)
-    
-    if gcs_bucket and gcs_blob_name:
-        print(f"Uploading forecast report to GCS bucket '{gcs_bucket}' as '{gcs_blob_name}'...", file=sys.stderr)
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(gcs_bucket)
-        blob = bucket.blob(gcs_blob_name)
-        blob.upload_from_string(json_content, content_type="application/json")
-        print("Upload successful.", file=sys.stderr)
-    else:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            f.write(json_content)
-        print(f"Successfully saved forecast report locally at: {filepath}", file=sys.stderr)
+    write_json_output(report, filepath, gcs_bucket, gcs_blob_name)
 
 def print_dry_run_report(report, term_index, total_terms, output_format="markdown"):
     """Prints the dry run report in markdown or HTML."""
@@ -145,6 +168,7 @@ def main_http(request):
     gcs_bucket = os.environ.get("OUTPUT_GCS_BUCKET")
     gcs_blob_name = os.environ.get("OUTPUT_FORECAST_BLOB", "forecast_vars.json")
     terms_json = os.environ.get("CONTRACT_TERMS_JSON")
+    webhook_url = os.environ.get("SOAR_WEBHOOK_URL")
     
     if not project_id or not gcs_bucket or not terms_json:
         return ("Missing GCP_PROJECT_ID, OUTPUT_GCS_BUCKET, or CONTRACT_TERMS_JSON environment variables.", 400)
@@ -157,6 +181,8 @@ def main_http(request):
             
         report = calculate_forecast(project_id, active_term, start_dt, end_dt)
         write_forecast_report(report, "", gcs_bucket, gcs_blob_name)
+        if webhook_url:
+            send_webhook_alert(report, webhook_url, project_id)
         return ("Ingestion forecast completed and report written to GCS.", 200)
     except Exception as e:
         return (f"Execution failed: {str(e)}", 500)
@@ -165,6 +191,7 @@ def main():
     parser = argparse.ArgumentParser(description="Google SecOps Consumption Forecast Engine (Multi-Term Support).")
     parser.add_argument("project_id", nargs="?", help="The GCP Project ID.")
     parser.add_argument("--terms-file", help="Path to local JSON file containing array of contract term configurations.")
+    parser.add_argument("--webhook-url", help="Optional Webhook URL to dispatch overage alerts.")
     parser.add_argument("--dry-run", action="store_true", help="Print dry run reports directly to terminal.")
     parser.add_argument("--format", choices=["markdown", "html"], default="markdown", help="Format for dry-run reports.")
     
@@ -173,6 +200,7 @@ def main():
     project_id = args.project_id or os.environ.get("GCP_PROJECT_ID")
     gcs_bucket = os.environ.get("OUTPUT_GCS_BUCKET")
     gcs_blob_name = os.environ.get("OUTPUT_FORECAST_BLOB", "forecast_vars.json")
+    webhook_url = args.webhook_url or os.environ.get("SOAR_WEBHOOK_URL")
     
     terms = []
     if args.terms_file:
@@ -213,6 +241,9 @@ def main():
         local_output_path = os.path.abspath(os.path.join(script_dir, "../terraform/forecast_vars.json"))
         write_forecast_report(report, local_output_path, gcs_bucket, gcs_blob_name)
     
+    if webhook_url:
+        send_webhook_alert(report, webhook_url, project_id)
+        
     if report["pct_commitment_consumed"] > report["pct_time_elapsed"] * 1.15:
         print("\n⚠️ WARNING: Ingestion rate exceeds ideal contract timeline trajectory.", file=sys.stderr)
         sys.exit(3)

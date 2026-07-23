@@ -9,50 +9,70 @@ This solution is designed to alert on ingestion pipeline outages, track parsed e
 ## 📂 Directory Structure
 ```
 /monitoring-solution/
-├── README.md                 <- This deployment guide
+├── README.md                    <- Comprehensive deployment & adoption guide
 ├── scripts/
-│   ├── run_profiler.py       <- Weekly script to profile ingestion SLA & metrics
-│   ├── drift_detector.py     <- Daily script to alert on unmonitored or silent sources
-│   ├── forecast_engine.py    <- Runs consumption calculations and alerts on overages
-│   ├── contract_terms.json   <- Multi-term contract schedules configuration sample
-│   └── requirements.txt      <- Dependencies for the Python engine
+│   ├── main.py                  <- Unified Cloud Run Function HTTP entrypoint
+│   ├── secops_monitoring_utils.py <- Shared utilities module (SOAR Webhook POST, duration format, GCS I/O)
+│   ├── run_profiler.py          <- SLA Ingestion Profiler & P99 arrival gap engine
+│   ├── drift_detector.py        <- Configuration Drift Detector & CATCH_ALL route monitor
+│   ├── forecast_engine.py       <- Multi-term contract consumption forecast engine
+│   ├── contract_terms.json      <- Multi-term contract schedule configuration
+│   └── requirements.txt         <- Dependencies for the Python engine
 └── terraform/
-    ├── main.tf               <- IaC deploying both BYOP alerts & Orchestration serverless components
-    ├── variables.tf          <- Alert and infrastructure variables
-    └── terraform.tfvars.json <- Configured parameter values (byop/orchestration project divisions)
+    ├── main.tf                  <- IaC deploying BYOP alert policies & single Orchestration Function
+    ├── variables.tf             <- Alert and infrastructure variable definitions
+    └── terraform.tfvars.json    <- Configured parameter values (project IDs, SLA monitors, contract terms)
 ```
 
 ---
 
-## 1. Architectural Rationale: Leveraging Google's Native Infrastructure Telemetry
+## 1. Architectural Rationale: Unified Serverless Orchestration
 
-This solution is designed to leverage Google's robust, enterprise-grade cloud infrastructure monitoring platform (**Google Cloud Monitoring**) to oversee your ingestion pipeline health, rather than relying on duplicate, in-SIEM analytics monitoring layers.
-
-By utilizing Google's native, dedicated metrics engine, the solution provides an efficient and highly resilient architecture for security telemetry monitoring:
+This solution leverages Google Cloud's dedicated telemetry platform (**Google Cloud Monitoring**) alongside a **single, unified Cloud Run Function** (`secops-monitoring-orchestrator`) to oversee ingestion pipeline health, track parsed event quality, profile source ingestion latency, and forecast license consumption—with **zero BigQuery requirement** for standard operations.
 
 ```
-+-------------------------------------------------------------------------------+
-|                            GOOGLE SECOPS CONSOLE                              |
-|                                                                               |
-|  +------------------------+                    +---------------------------+  |
-|  |     Custom Dashboards  |                    |      SOAR Alert Queue     |  |
-|  |  (YARA-L Ingestion)    |                    |  - Outage alerts queue    |  |
-|  +------------------------+                    +---------------------------+  |
-|               ^ (queries metrics)                            ^                |
-+---------------|----------------------------------------------|----------------+
-                |                                              | (webhooks)
-+------------------------------------+           +-------------+-------------+
-|    Cloud Monitoring API (BYOP)     | <-------- |    Orchestration Project  |
-|   - Outage / Absence Detection     |           |    - Python SLA engine    |
-+------------------------------------+           +---------------------------+
++----------------------------------------------------------------------------------------------------+
+|                                    CLOUD SCHEDULER JOBS                                            |
+|   ├── profiler_scheduler (Weekly)   ├── forecast_scheduler (Daily)   ├── drift_scheduler (Daily)   |
+|   └── POST {"action": "profiler"}   └── POST {"action": "forecast"}   └── POST {"action": "drift"}  |
++--------------------------------------------------+-------------------------------------------------+
+                                                   |
+                                                   v (HTTP POST Trigger)
++----------------------------------------------------------------------------------------------------+
+|                       UNIFIED CLOUD RUN FUNCTION (secops-monitoring-orchestrator)                  |
+|                        (scripts/main.py & scripts/secops_monitoring_utils.py)                     |
+|                                                                                                    |
+|   ├── Action: profiler  ──> Queries Cloud Monitoring API ──> Generates terraform.tfvars.json in GCS |
+|   ├── Action: forecast  ──> Projects contract runway    ──> Dispatches SOAR Webhook Alert on Overage  |
+|   └── Action: drift     ──> Checks CATCH_ALL / Feed Drift──> Dispatches SOAR Webhook Alert on Drift    |
++----------------------+-----------------------------------|-----------------------------------------+
+                       |                                   |
+                       v (GCS Upload)                      v (SOAR Webhook POST)
++--------------------------------------------+    +--------------------------------------------------+
+|      Cloud Storage Bucket (GCS)            |    |              GOOGLE SECOPS CONSOLE               |
+|      gs://<bucket>/terraform.tfvars.json   |    |                                                  |
++----------------------+---------------------+    |   +------------------------------------------+   |
+                       |                          |   |           SOAR Alert Queue               |   |
+                       v (GCS Object Trigger)     |   |   (Dedicated Environment: SecOps-Health) |   |
++--------------------------------------------+    |   +------------------------------------------+   |
+|           Cloud Build CI/CD                |    |                        ^                         |
+|   Executes `terraform apply` on change     |    |                        | (Alert Webhooks)        |
++----------------------+---------------------+    +------------------------|-------------------------+
+                       |                                                   |
+                       v (Deploys Alert Policies)                          |
++--------------------------------------------------------------------------+                         |
+|                       GOOGLE CLOUD MONITORING (BYOP Project)                                       |
+|   ├── Ingestion Alert Policies (Dynamic P99 Absence SLA, P95 Latency, Silent Host) ────────────────┘
+|   ├── Parsing Alert Policies (Parser Error Ratio, Catch-All Route Warning)
+|   └── Billing Alert Policies (Daily Quota Approaching Limit)
++----------------------------------------------------------------------------------------------------+
 ```
 
-### Strategic Benefits of This Architecture:
-1.  **Platform Efficiency**: Monitoring alerts are evaluated by a dedicated, low-latency infrastructure telemetry layer. Outages and ingestion anomalies are flagged in minutes without placing analytical load on your SIEM indexing or threat hunting engines.
-2.  **No Duplicate Agents or Pipelines**: Instead of deploying secondary collectors or configurations to query status, the solution queries native system metrics generated automatically by the platform's API gateways, forwarders, and normalizers.
-3.  **Consolidated Analyst Workflow**: Operational signals are fully unified within the analyst's day-to-day workspace:
-    *   **SOAR Incident Management**: Outage alerts are pushed via webhook directly to the **Google SecOps SOAR Alert Queue**, allowing security teams to manage and track collection issues using standard playbook workflows.
-    *   **Consolidated Dashboards**: Historical log volumes, ingestion limits, and parsing errors are tracked inside **Google SecOps Custom Dashboards** using YARA-L 2.0 queries on the native `ingestion` metrics schema.
+### Strategic Highlights of the Unified Architecture:
+1. **Single Cloud Run Function Deployment**: All analytical logic (`run_profiler.py`, `forecast_engine.py`, `drift_detector.py`) is encapsulated into a single HTTP serverless entrypoint (`main.py`), reducing cloud resource footprint and simplifying security lifecycle management.
+2. **Action Dispatch via HTTP Payload**: Cloud Scheduler jobs pass a lightweight JSON payload (`{"action": "profiler"}`, `{"action": "forecast"}`, `{"action": "drift"}`) to trigger specific tasks.
+3. **SOAR Webhook Integration**: Both engine-level alerts (contract overage, configuration drift) and infrastructure-level alerts (metric absence, latency surge) post SOAR-formatted JSON payloads directly to the **SecOps SOAR Alert Queue**.
+4. **Human-Readable Alert Telemetry**: Alert policy documentations and profiler outputs automatically convert raw seconds into clear human-readable magnitudes (e.g. `6h 18m`, `5m`, `30m`).
 
 ---
 
@@ -64,116 +84,54 @@ This solution satisfies the event logging (EL) requirements outlined in the Whit
 
 ---
 
-## 3. Alerts Summary & Alerting Logic
+## 3. Alerts Summary & Categorized Alerting Logic
 
-The solution generates the following primary alerts:
+The solution categorizes all alerts into 3 core operational domains:
 
-1.  **Log Ingestion Absence (Per Source)**: Triggers when no log records are ingested for a source (e.g. `WINDOWS_DNS`) for longer than its designated SLA window (e.g. 5m for realtime, 12h for variable).
-2.  **Silent Endpoint Host**: Alerts if a specific server host ceases sending logs, while the gateway agent remains online. (Requires Bindplane to copy `host.name` to the `ingestion_source` label).
-3.  **Active-Passive HA Outage**: Alerts only when *all* redundant cluster members (e.g. `prod-fw-1` and `prod-fw-2`) stop sending data simultaneously.
-4.  **Parser/Normalization Failure**: Alerts if parsing errors rise to $\ge 5\%$ of total logs in a 15-minute window, identifying vendor format shifts or broken parsers.
-5.  **Bindplane Agent Outage**: Alerts when a collection agent daemon fails or loses connectivity.
-6.  **Quota Approaching Limit**: Alerts when consumption rates reach $80\%$ of daily or monthly license volumes.
+### 1. Ingestion Category
+1. **Log Ingestion Absence (Per Source)**: Triggers when no log records are ingested for a source (e.g., `WINDOWS_DNS`) for longer than its dynamic P99 arrival SLA window.
+2. **P95 Ingestion Latency Surge**: Alerts when P95 ingestion latency exceeds 30 minutes (or $3\times$ baseline), identifying delayed ingestion pipelines that compromise YARA-L detection rule windows.
+3. **Silent Endpoint Host**: Alerts if a specific server host ceases sending logs while the gateway agent remains online.
+4. **Bindplane Agent / Feed Outage**: Alerts when a collection agent daemon fails or loses connectivity.
+5. **Log Spike & Log Dip**: MQL ratio policies detecting sudden surges ($>200\%$) or drops ($>70\%$) relative to historical baselines.
 
----
+### 2. Parsing Category
+1. **Parser/Normalization Degradation**: Alerts if parsing error ratio rises to $\ge 5\%$ over a 15-minute window, identifying vendor format shifts or broken parsers.
+2. **Catch-All Growth Warning**: Alerts when `CATCH_ALL` (or `UNSPECIFIED_LOG_TYPE`) volume surges, indicating unmapped Bindplane feeds or missing parser assignments.
 
-## 4. Ingestion Trends Without BigQuery (YARA-L Dashboard)
-
-If your Google SecOps instance does not export to BigQuery, use the native dashboard engine within SecOps. The engine natively supports the `ingestion` prefix with a 365-day query retention period.
-
-### Daily Throughput Chart (GB)
-Create a new custom dashboard widget in Google SecOps with this YARA-L 2.0 query:
-```yara
-ingestion.component = "Ingestion API"
-ingestion.log_type != ""
-ingestion.log_type != "FORWARDER_HEARTBEAT"
-
-$Date = timestamp.get_date(ingestion.end_time)
-
-match:
-  $Date
-outcome:
-  $Throughput_GB = math.round(sum(ingestion.log_volume) / (1000 * 1000 * 1000), 2)
-order:
-  $Date desc
-```
+### 3. Billing Category
+1. **Ingestion Quota Approaching Limit**: Alerts when consumption rates reach $80\%$ of daily capacity.
+2. **Contract Consumption Overage Forecast**: `forecast_engine.py` aggregates multi-term contract consumption velocity and dispatches Webhook alerts when projected end-of-term volume exceeds license commitments.
 
 ---
 
-## 5. Webhook Ontology Payload Mapping
+## 4. Ingestion Trends & Dashboards
 
-Alerts are sent as JSON payloads to the SOAR webhook. To ingest Google Cloud Monitoring alerts into Google SecOps SOAR via the webhook connector, the payload must be mapped to SOAR's internal alert and event ontology.
+> [!NOTE]
+> **Coming Soon**: This section will contain recommended native Google SecOps ingestion health and log monitoring dashboard visualizations.
 
-### Webhook JSON Payload Mapping
-Since Google Cloud Monitoring sends a fixed JSON payload structure, mapping must be applied in the SOAR Webhook integration mapper (or via a Cloud Function proxy).
+---
 
-| Google Cloud Monitoring Field | Google SecOps SOAR Ontology Field | Transformation / Logic |
+## 5. Google SecOps SOAR Ontology Field Mapping Guide
+
+Alerts dispatched to the SOAR incoming Webhook endpoint follow a standardized JSON schema. Map incoming JSON alert keys to SOAR ontology fields using the reference guide below:
+
+| JSON Payload Field | Google SecOps SOAR Ontology Field | Description / Mapping Logic |
 | :--- | :--- | :--- |
-| `incident.started_at` | `StartTime` | Multiply by 1000 (convert Unix timestamp to epoch ms) |
-| `incident.ended_at` | `EndTime` | Multiply by 1000 (if present; defaults to current epoch ms) |
-| `"Google Cloud Monitoring"` | `product_type` | Hardcoded string literal |
-| `incident.condition_name` | `event_type` | Direct mapping of alert condition type |
-| `incident.incident_id` | `soar_alert_id` | Unique ID mapping for deduplication |
-| `incident.started_at` | `detection_time` | Multiply by 1000 |
-| `incident.policy_name` | `source_rule` | Identifies the monitoring rule triggered |
-| `incident.url` | `source_system_uri` | Direct link to the incident page in GCP Console |
-| `incident.summary` | `Message` | Short descriptive message |
-| `incident.documentation.content` | `description` | Maps the Markdown-formatted SOP documentation |
-| `incident.state` | `CategoryOutcome` | Mapped value (e.g. "open" or "closed") |
-| `incident.scoping_project_id` | `custom_fields["project_id"]` | Dynamic key-value custom field |
-| Resource / Metric Labels | `custom_fields["log_type"]`, etc. | Dynamic fields representing the impacted collector/feed |
-
-### Example SOAR Webhook Ingestion JSON
-This JSON represents the mapped output delivered to the SOAR webhook receiver:
-
-```json
-{
-  "StartTime": 1782918400000,
-  "EndTime": 1782918700000,
-  "product_type": "Google Cloud Monitoring",
-  "event_type": "Metric Absence",
-  "soar_alert_id": "incident_30b5e050_7c2b_489d",
-  "detection_time": 1782918400000,
-  "source_rule": "SecOps Source Silent - WINEVTLOG",
-  "source_system_uri": "https://console.cloud.google.com/monitoring/alerting/incidents/incident_30b5e050_7c2b_489d?project=my-byop-project",
-  "Message": "No logs ingested for WINEVTLOG in the last 60 minutes.",
-  "description": "Please review Outage Alert Response SOP located at SOP-URI. Check forwarder and collector health.",
-  "Severity": "Critical",
-  "CategoryOutcome": "open",
-  "custom_fields": {
-    "project_id": "my-byop-project",
-    "collector_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-    "log_type": "WINEVTLOG",
-    "ingestion_source": "central-syslog-gateway-us"
-  }
-}
-```
-
-### Google SecOps SOAR Ontology Field Mapping Guide
-
-When configuring the webhook mapping inside the Google SecOps SOAR console, map the keys from the JSON alert payload to the SOAR ontology fields using the following reference table:
-
-#### 1. Mandatory Fields Mapping
-These fields are critical for basic alert indexing and deduplication in the SOAR queue:
-*   **`TicketId`** $\leftarrow$ `soar_alert_id` (e.g., `"incident_30b5e050_7c2b_489d"`). Unique identifier to track the incident.
-*   **`SourceSystemName`** $\leftarrow$ `"Google Cloud Monitoring"`. Hardcoded source tag indicating the metrics origin.
-*   **`Name`** $\leftarrow$ `source_rule` (e.g., `"SecOps Source Silent - WINEVTLOG"`). The alert rule name shown in queues.
-*   **`DeviceVendor`** $\leftarrow$ `"Google Cloud"`. The infrastructure vendor tag.
-*   **`RuleGenerator`** $\leftarrow$ `source_rule` (e.g., `"SecOps Source Silent - WINEVTLOG"`). Identifies the rule generating this alert.
-*   **`StartTime`** $\leftarrow$ `StartTime` (e.g., `1782918400000`). Epoch millisecond timestamp of the incident start window.
-
-#### 2. Advanced / Event Fields Mapping
-These fields enrich the alert event log payload with operational telemetry and priorities:
-*   **`Environment`** $\leftarrow$ `custom_fields.project_id` (e.g., `"my-byop-project"`). Segregates cases based on project boundaries.
-*   **`Description`** $\leftarrow$ `description` (e.g., SOP guidance text block). Standard Operating Procedure and playbook instructions.
-*   **`DisplayId`** $\leftarrow$ `soar_alert_id` (e.g., `"incident_30b5e050_7c2b_489d"`). The display name for alert card headers.
-*   **`Reason`** $\leftarrow$ `Message` (e.g., `"No logs ingested for WINEVTLOG..."`). Summary description explaining the trigger.
-*   **`DeviceProduct`** $\leftarrow$ `product_type` (e.g., `"Google Cloud Monitoring"`). Categorizes the monitoring system tool.
-*   **`EndTime`** $\leftarrow$ `EndTime` (e.g., `1782918700000`). Epoch millisecond timestamp of the incident end window.
-*   **`Priority`** $\leftarrow$ `Severity` (e.g., `"Critical"`). SOAR case prioritization scoring.
-*   **`EventProduct`** $\leftarrow$ `product_type` (e.g., `"Google Cloud Monitoring"`). Maps to the underlying event telemetry category.
-*   **`EventName`** $\leftarrow$ `event_type` (e.g., `"Metric Absence"`). Maps to the specific trigger subcategory.
-*   **`EventsList`** $\leftarrow$ An array version of the `custom_fields` metadata block containing `collector_id`, `log_type`, and `ingestion_source` variables to enable analysts to inspect target assets inside the event panel.
+| `soar_alert_id` | `TicketId`, `DisplayId` | Unique incident identifier for alert queue indexing and deduplication. |
+| `"Google Cloud Monitoring"` | `SourceSystemName`, `DeviceVendor` | Originating telemetry source system tag. |
+| `source_rule` | `Name`, `RuleGenerator` | Alert rule title displayed in analyst queues (e.g., `"SecOps Source Silent - WINEVTLOG"`). |
+| `StartTime` | `StartTime` | Epoch millisecond timestamp of alert trigger. |
+| `EndTime` | `EndTime` | Epoch millisecond timestamp of incident close/update. |
+| `Message` | `Reason` | High-level summary of the triggered alert condition. |
+| `description` | `Description` | Detailed Markdown text including Operating Procedures (SOP) and remediation guidance. |
+| `Severity` | `Severity`, `Priority` | Priority level (`"Critical"`, `"High"`, `"Warning"`). |
+| `CategoryOutcome` | `CategoryOutcome` | Status outcome (`"open"`). |
+| `product_type` | `DeviceProduct`, `EventProduct` | Categorizes the monitoring system tool (`"Google Cloud Monitoring"`). |
+| `event_type` | `EventName` | Specific trigger subcategory (e.g., `"Metric Absence"`, `"Configuration Drift Warning"`). |
+| `custom_fields.project_id` | `Environment` | Segregates alert cases into dedicated SOAR environments (e.g. `SecOps-Health`). |
+| `custom_fields.log_type` | `custom_fields["log_type"]` | Impacted Security Log Type schema label (e.g., `"AZURE_AD_AUDIT"`). |
+| `custom_fields` | `EventsList` | Array representation of custom metadata fields (`collector_id`, `log_type`, `ingestion_source`) for analyst inspection in event panels. |
 
 ---
 
@@ -254,76 +212,54 @@ gcloud services enable \
 
 ---
 
-### Step 5: Configure the Deployment Variables
-Navigate to the `terraform` folder and edit the `terraform.tfvars.json` file. Provide your parameters:
-
-```json
-{
-  "byop_project_id": "<YOUR_BYOP_PROJECT_ID>",
-  "orchestration_project_id": "<YOUR_ORCHESTRATION_PROJECT_ID>",
-  "region": "us-central1",
-  "contract_terms_json": "[\n  {\n    \"start_date\": \"2026-01-01T00:00:00Z\",\n    \"end_date\": \"2026-12-31T23:59:59Z\",\n    \"committed_gb\": 365000.0\n  }\n]"
-}
-```
-
-*   **byop_project_id**: Project where Alert Policies are written.
-*   **orchestration_project_id**: Project where GCS buckets, Cloud Run Functions, and Scheduler are deployed.
-*   **contract_terms_json**: The timeline of committed daily/yearly volumes for overage forecasting (represented as a serialized JSON string). 
-    > [!NOTE]
-    > If you do not have your contract details (committed GB pools or term dates) handy, **please reach out to your Google Cloud Representative or Account Team** to retrieve the exact allocations.
-    > The Webhook URL is loaded securely from the Secret Manager secret (`secops-soar-webhook-url`) created in Step 3, meaning it does not need to be specified in cleartext variables.
+### Step 5: Configure Contract Terms, Overrides & Project IDs
+1. **Contract Terms Schedule**: Edit `scripts/contract_terms.json` to define your 1-year or multi-year terms schedule. This is the single source of truth for contract commitments.
+2. **Manual SLA & Host Overrides**: Define any custom feed or silent host overrides in `scripts/overrides.json`.
+3. **Project IDs Configuration**: Edit `terraform/terraform.tfvars.json` to specify your project IDs and region:
+   ```json
+   {
+     "byop_project_id": "<YOUR_BYOP_PROJECT_ID>",
+     "orchestration_project_id": "<YOUR_ORCHESTRATION_PROJECT_ID>",
+     "region": "us-central1"
+   }
+   ```
+   > [!TIP]
+   > You **do not** need to manually format or serialize JSON strings inside `terraform.tfvars.json`. The profiler script automatically reads `scripts/contract_terms.json` and injects the serialized `contract_terms_json` string into `terraform.tfvars.json` during execution!
 
 ---
 
-### Step 6: Bootstrap Ingestion Metrics (Dry-Run Check)
-Before deploying, it is best practice to run the scripts in a Python Virtual Environment (`venv` or `uv`) to verify that your credentials can query Google Cloud Monitoring metrics:
+### Step 6: Initial SLA Profiling & Configuration Generation Run
+Execute `run_profiler.py` to query metrics, apply overrides, auto-serialize contract terms, and populate `terraform.tfvars.json`:
 
-#### Option A: Using Python standard `venv`
 ```bash
-# 1. Create virtual environment
-python3 -m venv venv
+cd google-secops/monitoring-solution/scripts
 
-# 2. Activate virtual environment
-source venv/bin/activate
-
-# 3. Install required Python libraries
-pip3 install -r ../scripts/requirements.txt
-
-# 4. Run the profiler dry run (replace project ID with your BYOP Project ID)
-python3 ../scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run
-```
-
-#### Option B: Using `uv` (recommended for faster setup)
-```bash
-# 1. Create and activate virtual environment
-uv venv
+# Activate Virtual Environment
 source .venv/bin/activate
 
-# 2. Install dependencies and run the dry run
-uv pip install -r ../scripts/requirements.txt
-python3 ../scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run
+# Generate and populate terraform.tfvars.json
+python3 run_profiler.py <YOUR_BYOP_PROJECT_ID>
 ```
-*If successful, this will output a markdown list of all log feeds detected in the environment and their SLA thresholds.*
-
-To update the default variables file before initial provisioning, run:
-```bash
-python3 ../scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID>
-```
-*(Remember to deactivate your virtual environment afterwards using the `deactivate` command).*
 
 ---
 
-### Step 7: Provision via Terraform
-Deploy the alerting policies and serverless schedulers to GCP:
+### Step 7: Provision Infrastructure via Terraform
+Deploy alerting policies and serverless schedulers to Google Cloud:
+
 ```bash
-# 1. Initialize Terraform plugins
+cd ../terraform
+
+# Initialize Terraform plugins
 terraform init
 
-# 2. Review the plan changes to verify both project targets
-terraform plan
+# Validate configuration syntax
+terraform validate
 
-# 3. Apply changes (deploys alerting rules to BYOP and serverless triggers to Orchestration)
-terraform apply -auto-approve
+# Review execution plan
+terraform plan -var-file="terraform.tfvars.json"
+
+# Apply changes
+terraform apply -var-file="terraform.tfvars.json" -auto-approve
 ```
 
 ---
@@ -382,62 +318,82 @@ Create a Cloud Build trigger that automatically executes `terraform apply` when 
 
 ## 10. Verification, Validation & Dry-Run Guides
 
-Before deploying configurations, use the built-in **Dry Run** flag to evaluate calculations directly inside your terminal in markdown or HTML formats.
+### 1. Terminal CLI Dry-Run Testing (Python Virtual Environment)
 
-### 1. Profiler Dry Run
-Queries Cloud Monitoring API and prints the suggested SLA window configurations as a markdown table:
+Run dry-run reports directly in your terminal using Python virtual environment to evaluate dynamic SLA windows, latency thresholds, consumption overages, and drift findings before applying Terraform configurations:
+
 ```bash
-# Run local dry run
-python3 scripts/run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run --format markdown
+cd google-secops/monitoring-solution/scripts
+
+# Activate Virtual Environment
+source .venv/bin/activate
+
+# 1. SLA Profiler & Latency Threshold Dry-Run
+python3 run_profiler.py <YOUR_BYOP_PROJECT_ID> --dry-run
+
+# 2. Consumption Forecast Engine Dry-Run (with Webhook dispatch test)
+python3 forecast_engine.py <YOUR_BYOP_PROJECT_ID> \
+  --terms-file contract_terms.json \
+  --dry-run \
+  --webhook-url https://webhook.site/b563870a-190f-4c99-b7b6-d097cc6b2bde
+
+# 3. Configuration Drift & CATCH_ALL Route Detector Dry-Run
+python3 drift_detector.py <YOUR_BYOP_PROJECT_ID> \
+  --webhook-url https://webhook.site/b563870a-190f-4c99-b7b6-d097cc6b2bde
 ```
 
-#### Output Example:
-| Log Type | SLA Profile | Alert Window (sec) | Daily Avg Logs | Volume Threshold |
-| :--- | :--- | :--- | :--- | :--- |
-| **CROWDSTRIKE_EDR** | realtime | 300 | 540301 | 54030 |
-| **GCP_CLOUDTRAIL** | near_realtime | 1200 | 120401 | 12040 |
-| **WINDOWS_DNS** | batch | 7200 | 25032 | 2503 |
+---
 
-### 2. Consumption Forecast Engine Dry Run (Multi-Year Contract Verification)
-Queries current log metrics since the active contract term and projects overage:
-```bash
-# Point to the multi-year config file directly for terminal dry-run review
-python3 scripts/forecast_engine.py \
-  <YOUR_BYOP_PROJECT_ID> \
-  --terms-file scripts/contract_terms.json \
-  --dry-run --format markdown
-```
+#### 📊 Sample Output: SLA Ingestion Profiler (`run_profiler.py`)
+| Log Type | SLA Profile | P99 Gap | Alert Window (Human) | Alert Window (sec) | P95 Latency Thresh | Daily Avg Logs | Volume Threshold |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **AZURE_AD_AUDIT** | batch | 4h 12m | **6h 18m** | 22680 | 30m | 21 | 10 |
+| **GCP_CLOUDAUDIT** | realtime | 1m | **5m** | 300 | 30m | 486,541 | 48,654 |
+| **GCP_LOADBALANCING** | near_realtime | 49m | **1h 13m** | 4410 | 30m | 1,433 | 143 |
+| **WORKSPACE_ACTIVITY** | batch | 3h 6m | **4h 39m** | 16740 | 30m | 25 | 10 |
 
-#### Output Example:
+---
+
+#### 📊 Sample Output: Consumption Forecast Engine (`forecast_engine.py`)
 **Active Contract Term:** Year 1 of 3
 
 | Parameter | Value |
 | :--- | :--- |
-| **Calculated At** | 2026-07-01T12:00:00Z |
-| **Active Term Range** | 2026-01-01T00:00:00Z to 2026-12-31T23:59:59Z (181 days elapsed, 184 remaining) |
-| **Committed License Volume** | 365000.0 GB |
-| **Cumulative Ingested** | 210403.5 GB (57.64% of active quota) |
-| **Ideal Target Volume** | 181000.0 GB (49.58% of term) |
-| **Projected Volume (Term End)** | 424218.42 GB |
-| **Estimated Overage** | **59218.42 GB** |
+| **Calculated At** | 2026-07-23T21:57:40Z |
+| **Active Term Range** | 2026-01-01T00:00:00Z to 2026-12-31T23:59:59Z (203 days elapsed, 161 remaining) |
+| **Committed License Volume** | 1,825.0 GB |
+| **Cumulative Ingested** | 7.9 GB (0.43% of active quota) |
+| **Ideal Target Volume** | 1,017.33 GB (55.62% of term) |
+| **Projected Volume (Term End)** | 14.16 GB |
+| **Estimated Overage** | **0.0 GB** |
+| **Webhook Status** | `Webhook alert successfully dispatched (HTTP 200)` |
 
-### 3. Simulating an Ingestion Outage Alert
-To verify that absence alerts trigger and route correctly to your notification channel, simulate an outage:
-1.  Temporarily lower the absence threshold for a specific feed (e.g., set `alert_window_seconds = 60` for a test feed) inside `terraform.tfvars.json`.
-2.  Run `terraform apply` to deploy the change.
-3.  Stop sending test logs to that stream for 1 minute.
-4.  Monitor the Cloud Monitoring console to ensure the policy transitions to the **Firing** state.
-5.  Revert the threshold window and redeploy `terraform apply`.
+---
 
-### 4. Webhook Payload & Ontology Verification
-Verify that the payload structure integrates correctly with Google SecOps SOAR:
-1.  Go to the **Google Cloud Monitoring console > Alerting > Notification Channels**.
-2.  Select your Webhook Gateway channel and click **Send Test Connection**.
-3.  Inside your Google SecOps SOAR console, open **Incoming Webhooks Log** and verify:
-    *   The connection payload was received successfully.
-    *   Ontology mappings mapped `policy_name` to `source_rule` and timestamps correctly parsed.
+#### 📊 Sample Output: Configuration Drift Detector (`drift_detector.py`)
+| Finding Type | Log Type | Daily Avg (GB/day) | Discrepancy Action / Recommendation |
+| :--- | :--- | :--- | :--- |
+| **DECOMMISSIONED_OR_SILENT_SOURCE** | `AZURE_AD_CONTEXT` | 0.00 GB | Feed silent for >7 days. Remove from `monitors` or check upstream Azure collector. |
+| **NEW_UNMONITORED_SOURCE** | `AWS_CLOUDTRAIL` | 14.20 GB | Newly active log feed detected. Run profiler to generate SLA and update `terraform.tfvars.json`. |
+| **CATCH_ALL_LOG_TYPE_WARNING** | `CATCH_ALL` | 2.40 GB | Unparsed logs arriving at catch-all route. Inspect BindPlane/Forwarder fallback routes. |
 
-To manually trigger and test the webhook endpoint, post the JSON alert payload using the following `curl` command (replace target URL with your SOAR incoming webhook endpoint):
+---
+
+### 2. Terraform Deployment Validation
+
+After completing dry-run checks and generating `terraform.tfvars.json`, validate and apply your deployment following **Step 7** in the Deployment Guide above.
+
+---
+
+### 3. SOAR Environment Recommendation & Webhook Integration
+
+> [!TIP]
+> **Recommended SOAR Environment Configuration**:
+> When configuring the incoming Webhook endpoint in **Google SecOps SOAR**, we strongly recommend assigning incoming health & infrastructure webhooks to a dedicated **SOAR Environment** (e.g. `Infra-Monitoring` or `SecOps-Health`):
+> - **Clear Incident Separation**: Separates system telemetry and collection outage tickets from security threat detection alerts.
+> - **Targeted Playbook Automation**: Enables specialized SOAR playbooks (e.g., auto-restarting a BindPlane agent or pinging feed owners) to execute automatically without clogging security analyst queues.
+
+To test the Webhook endpoint manually from your workstation:
 ```bash
 curl -X POST \
   -H "Content-Type: application/json" \
@@ -457,19 +413,70 @@ curl -X POST \
     "custom_fields": {
       "project_id": "my-byop-project",
       "collector_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-      "log_type": "WINEVTLOG",
-      "ingestion_source": "central-syslog-gateway-us"
+      "log_type": "WINEVTLOG"
     }
   }' \
-  https://secops-instance.siemplify-soar.com/api/webhooks/incoming/gcp-monitoring
+  https://<YOUR_SOAR_INSTANCE>/api/webhooks/incoming/gcp-monitoring
 ```
 
 ---
 
-## 11. Customization & Adjustments
-*   **Adjusting SLA Thresholds**: To manually override a feed's SLA window (e.g. increase an Azure feed's absence alert threshold to 12 hours), edit the corresponding entry block in `terraform.tfvars.json` and redeploy.
-*   **Managing Exclusions**: If a test collector or log type triggers false positive alerts, exclude it inside `terraform/main.tf` by appending filter rules (e.g. `AND metric.labels.log_type != "DUMMY_SOURCE"`).
-*   **Manual Trigger**: You can trigger the SLA profiling script immediately from the GCP Console (Cloud Functions page) or by running the weekly Cloud Scheduler job manually using:
-    ```bash
-    gcloud scheduler jobs run secops-profiler-weekly-trigger --location=us-central1
-    ```
+## 11. Frequently Asked Questions & Customization
+
+### Q1: How do manual SLA and Silent Host exceptions persist when the profiler updates `terraform.tfvars.json`?
+> **Answer**:
+> The profiler checks for an optional `scripts/overrides.json` file during every run. You can configure custom absence windows, P95 latency thresholds, or explicitly ignore specific log types or silent endpoint hosts:
+> ```json
+> {
+>   "log_types": {
+>     "AZURE_AD_AUDIT": {
+>       "alert_window_seconds": 43200,
+>       "latency_p95_seconds": 3600
+>     },
+>     "TEST_FEED": {
+>       "ignore": true
+>     }
+>   },
+>   "hosts": {
+>     "decommissioned-server-01": {
+>       "ignore": true
+>     },
+>     "critical-syslog-host-01": {
+>       "alert_window_seconds": 600,
+>       "ignore": false
+>     }
+>   }
+> }
+> ```
+> Settings in `overrides.json` are automatically merged into the profiler output and persisted across automated weekly profiling runs. Setting `"ignore": true` on a host or log type prevents alert policies from being created for it.
+
+### Q2: If I decommission or remove a log source, do its Cloud Monitoring alert policies get deleted?
+> **Answer**:
+> **Yes, automatically!** Because Terraform manages feed alert policies using `for_each = var.monitors`:
+> 1. When a log feed is removed from `terraform.tfvars.json` (either manually or when `drift_detector.py` flags a decommissioned feed), `var.monitors` no longer contains that `log_type` key.
+> 2. On the next `terraform apply` (triggered automatically via Cloud Build GCS trigger or manually), Terraform detects that the corresponding `google_monitoring_alert_policy.log_feed_absence["LOG_TYPE"]` resource is no longer defined in configuration.
+> 3. Terraform **automatically destroys and removes** the old alert policies from Google Cloud Monitoring, maintaining zero alert drift.
+
+---
+
+## 12. References & Citations
+
+### 1. Framework Architecture & ML Principles
+*   **Joe Lopes - Log Health Monitoring**: [lopes.id/log/log-health-monitoring/](https://lopes.id/log/log-health-monitoring/)
+*   **Gist: `log-health.gs` (Apps Script Notifications)**: [gist.github.com/lopes/041a25c7792303eb15ab600251f5c11b](https://gist.github.com/lopes/041a25c7792303eb15ab600251f5c11b)
+*   **Gist: `derive-seeds.py` (Reassessment Tool)**: [gist.github.com/lopes/54809c3ac1f0ae007bb4f48cdd217f92](https://gist.github.com/lopes/54809c3ac1f0ae007bb4f48cdd217f92)
+
+### 2. SIEM Latency & Delay Research
+*   **That SIEM Guy - Identifying Late Arriving Log Sources**: [medium.com/@thatsiemguy/identifying-late-arriving-log-sources-8780b1f01836](https://medium.com/@thatsiemguy/identifying-late-arriving-log-sources-8780b1f01836)
+*   **That SIEM Guy - Latency Analysis in Google SecOps**: [medium.com/@thatsiemguy/latency-analysis-in-google-secops-3f94291a82c7](https://medium.com/@thatsiemguy/latency-analysis-in-google-secops-3f94291a82c7)
+*   **Google Security Operations - Understand Rule Detection Delays**: [docs.cloud.google.com/chronicle/docs/detection/detection-delays](https://docs.cloud.google.com/chronicle/docs/detection/detection-delays)
+
+### 3. Official Google Cloud Ingestion Documentation
+*   **Ingestion Overview**: [docs.cloud.google.com/chronicle/docs/ingestion/ingestion-overview](https://docs.cloud.google.com/chronicle/docs/ingestion/ingestion-overview)
+*   **Understand Ingestion Metrics**: [docs.cloud.google.com/chronicle/docs/ingestion/understand-ingestion-metrics2](https://docs.cloud.google.com/chronicle/docs/ingestion/understand-ingestion-metrics2)
+*   **Ingestion Notifications for Health Metrics**: [docs.cloud.google.com/chronicle/docs/ingestion/ingestion-notifications-for-health-metrics](https://docs.cloud.google.com/chronicle/docs/ingestion/ingestion-notifications-for-health-metrics)
+*   **Silent Host Monitoring**: [docs.cloud.google.com/chronicle/docs/ingestion/silent-host-monitoring](https://docs.cloud.google.com/chronicle/docs/ingestion/silent-host-monitoring)
+*   **View Billed Ingestion Volume**: [docs.cloud.google.com/chronicle/docs/ingestion/view-billed-ingestion-volume](https://docs.cloud.google.com/chronicle/docs/ingestion/view-billed-ingestion-volume)
+*   **Analyze Feed Activity with Cloud Logging**: [docs.cloud.google.com/chronicle/docs/ingestion/analyze-feed-activity-with-cloud-logging](https://docs.cloud.google.com/chronicle/docs/ingestion/analyze-feed-activity-with-cloud-logging)
+*   **Troubleshooting Ingestion**: [docs.cloud.google.com/chronicle/docs/ingestion/troubleshooting-ingestion](https://docs.cloud.google.com/chronicle/docs/ingestion/troubleshooting-ingestion)
+*   **Understand Billing**: [docs.cloud.google.com/chronicle/docs/onboard/understand-billing](https://docs.cloud.google.com/chronicle/docs/onboard/understand-billing)

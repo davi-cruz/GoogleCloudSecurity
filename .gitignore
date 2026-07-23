@@ -4,3 +4,5 @@ venv/
 *.zip
 terraform/forecast_vars.json
 terraform/scripts_deployment.zip
+google-secops/monitoring-solution/terraform/.terraform.d/checkpoint_signature
+*.pyc

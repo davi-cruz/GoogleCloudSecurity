@@ -14,7 +14,8 @@ import time
 from datetime import datetime, timezone
 import functions_framework
 from google.cloud import monitoring_v3
-from google.cloud import storage
+
+from secops_monitoring_utils import format_human_duration, write_json_output
 
 # Default SLA Mapping rules
 # Threshold is 99% of logs arrived within:
@@ -82,7 +83,11 @@ def analyze_ingestion_sla(project_id, lookback_days=15):
         
         if not gaps:
             profile = "variable"
+            p99_gap = 28800
         else:
+            gaps.sort()
+            p99_idx = int(len(gaps) * 0.99)
+            p99_gap = gaps[min(p99_idx, len(gaps) - 1)]
             avg_gap = sum(gaps) / len(gaps)
             
             if avg_gap <= 90:
@@ -94,6 +99,11 @@ def analyze_ingestion_sla(project_id, lookback_days=15):
             else:
                 profile = "variable"
 
+        # Calculate dynamic heartbeat window (1.5 * p99_gap clamped between 300s and 1209600s / 14 days)
+        dynamic_alert_window = max(300, min(1209600, int(p99_gap * 1.5)))
+        # Override with SLA profile window if smaller for realtime feeds
+        alert_window = min(SLA_PROFILES[profile]["alert_window_seconds"], dynamic_alert_window) if profile == "realtime" else dynamic_alert_window
+
         total_logs = sum(volumes)
         days_span = (max(timestamps) - min(timestamps)) / 86400.0
         daily_avg_logs = total_logs / max(0.1, days_span)
@@ -101,49 +111,121 @@ def analyze_ingestion_sla(project_id, lookback_days=15):
         log_profiles[log_type] = {
             "log_type": log_type,
             "sla_profile": profile,
-            "alert_window_seconds": SLA_PROFILES[profile]["alert_window_seconds"],
+            "p99_gap_seconds": p99_gap,
+            "alert_window_seconds": alert_window,
+            "alert_window_human": format_human_duration(alert_window),
+            "latency_p95_seconds": 1800,  # 30 minutes default P95 latency threshold
+            "latency_p95_human": "30m",
             "daily_avg_logs": int(daily_avg_logs),
             "volume_threshold": max(10, int(daily_avg_logs * 0.1))
         }
 
-    return log_profiles
+    # Merge persistent manual exceptions if overrides.json exists
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    overrides_path = os.path.join(script_dir, "overrides.json")
+    log_profiles, host_profiles = apply_manual_overrides(log_profiles, overrides_path)
 
-def write_output(profiles, filepath, gcs_bucket=None, gcs_blob_name=None):
-    """Writes results locally or uploads to a GCS bucket."""
-    tf_data = {
-        "monitors": profiles
-    }
-    json_content = json.dumps(tf_data, indent=2)
+    return log_profiles, host_profiles
+
+def apply_manual_overrides(log_profiles, overrides_filepath):
+    """Merges manual log type and host SLA overrides from overrides.json."""
+    host_profiles = {}
+    if not os.path.exists(overrides_filepath):
+        return log_profiles, host_profiles
+        
+    try:
+        with open(overrides_filepath, "r") as f:
+            data = json.load(f)
+            
+        # Support legacy direct dictionary or nested "log_types" / "hosts" format
+        log_overrides = data.get("log_types", data if not ("log_types" in data or "hosts" in data) else {})
+        host_overrides = data.get("hosts", {})
+            
+        for log_type, override in log_overrides.items():
+            if log_type in log_profiles:
+                if "alert_window_seconds" in override:
+                    w = override["alert_window_seconds"]
+                    log_profiles[log_type]["alert_window_seconds"] = w
+                    log_profiles[log_type]["alert_window_human"] = format_human_duration(w)
+                if "latency_p95_seconds" in override:
+                    l = override["latency_p95_seconds"]
+                    log_profiles[log_type]["latency_p95_seconds"] = l
+                    log_profiles[log_type]["latency_p95_human"] = format_human_duration(l)
+                if "volume_threshold" in override:
+                    log_profiles[log_type]["volume_threshold"] = override["volume_threshold"]
+                if override.get("ignore", False):
+                    del log_profiles[log_type]
+            elif not override.get("ignore", False):
+                log_profiles[log_type] = {
+                    "log_type": log_type,
+                    "sla_profile": override.get("sla_profile", "manual"),
+                    "p99_gap_seconds": override.get("alert_window_seconds", 3600),
+                    "alert_window_seconds": override.get("alert_window_seconds", 3600),
+                    "alert_window_human": format_human_duration(override.get("alert_window_seconds", 3600)),
+                    "latency_p95_seconds": override.get("latency_p95_seconds", 1800),
+                    "latency_p95_human": format_human_duration(override.get("latency_p95_seconds", 1800)),
+                    "daily_avg_logs": 0,
+                    "volume_threshold": override.get("volume_threshold", 10)
+                }
+
+        for host_name, override in host_overrides.items():
+            w = override.get("alert_window_seconds", 600)
+            host_profiles[host_name] = {
+                "host_name": host_name,
+                "alert_window_seconds": w,
+                "alert_window_human": format_human_duration(w),
+                "ignore": override.get("ignore", False)
+            }
+
+    except Exception as e:
+        print(f"Warning: Failed to load overrides file '{overrides_filepath}': {e}", file=sys.stderr)
+        
+    return log_profiles, host_profiles
+
+def write_output(profiles, filepath, gcs_bucket=None, gcs_blob_name=None, host_profiles=None):
+    """Writes results locally or uploads to a GCS bucket, merging contract terms and existing tfvars."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    if gcs_bucket and gcs_blob_name:
-        print(f"Uploading output to GCS bucket '{gcs_bucket}' as '{gcs_blob_name}'...", file=sys.stderr)
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(gcs_bucket)
-        blob = bucket.blob(gcs_blob_name)
-        blob.upload_from_string(json_content, content_type="application/json")
-        print("Upload successful.", file=sys.stderr)
-    else:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
-            f.write(json_content)
-        print(f"Successfully generated Terraform variables file at: {filepath}", file=sys.stderr)
+    # Read existing tfvars if present to preserve user project IDs/region
+    tf_data = {}
+    if filepath and os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                tf_data = json.load(f)
+        except Exception:
+            tf_data = {}
+
+    tf_data["monitors"] = profiles
+    tf_data["host_monitors"] = host_profiles or {}
+
+    # Auto-serialize contract_terms.json if present
+    terms_path = os.path.join(script_dir, "contract_terms.json")
+    if os.path.exists(terms_path):
+        try:
+            with open(terms_path, "r") as f:
+                terms_data = json.load(f)
+                tf_data["contract_terms_json"] = json.dumps(terms_data)
+        except Exception as e:
+            print(f"Warning: Could not auto-serialize contract_terms.json: {e}", file=sys.stderr)
+
+    write_json_output(tf_data, filepath, gcs_bucket, gcs_blob_name)
 
 def print_dry_run_report(profiles, output_format="markdown"):
     """Prints the dry run report to stdout in markdown or html format."""
     if output_format == "html":
-        print("<h2>SecOps SLA Profiler Dry Run Report</h2>")
+        print("<h2>SecOps Log Ingestion & SLA Profiler Dry Run Report</h2>")
         print("<table border='1'>")
-        print("  <tr><th>Log Type</th><th>SLA Profile</th><th>Alert Window (sec)</th><th>Daily Avg Logs</th><th>Volume Threshold</th></tr>")
+        print("  <tr><th>Log Type</th><th>SLA Profile</th><th>P99 Gap</th><th>Alert Window (Human)</th><th>Alert Window (sec)</th><th>P95 Latency Thresh</th><th>Daily Avg Logs</th><th>Volume Thresh</th></tr>")
         for log_type, p in sorted(profiles.items()):
-            print(f"  <tr><td><b>{log_type}</b></td><td>{p['sla_profile']}</td><td>{p['alert_window_seconds']}</td><td>{p['daily_avg_logs']}</td><td>{p['volume_threshold']}</td></tr>")
+            print(f"  <tr><td><b>{log_type}</b></td><td>{p['sla_profile']}</td><td>{format_human_duration(p['p99_gap_seconds'])}</td><td><b>{p['alert_window_human']}</b></td><td>{p['alert_window_seconds']}</td><td>{p['latency_p95_human']}</td><td>{p['daily_avg_logs']}</td><td>{p['volume_threshold']}</td></tr>")
         print("</table>")
     else:
         # Markdown default
-        print("# SecOps SLA Profiler Dry Run Report\n")
-        print("| Log Type | SLA Profile | Alert Window (sec) | Daily Avg Logs | Volume Threshold |")
-        print("| :--- | :--- | :--- | :--- | :--- |")
+        print("# SecOps Log Ingestion & SLA Profiler Dry Run Report\n")
+        print("| Log Type | SLA Profile | P99 Gap | Alert Window (Human) | Alert Window (sec) | P95 Latency Thresh | Daily Avg Logs | Volume Threshold |")
+        print("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for log_type, p in sorted(profiles.items()):
-            print(f"| **{log_type}** | {p['sla_profile']} | {p['alert_window_seconds']} | {p['daily_avg_logs']} | {p['volume_threshold']} |")
+            print(f"| **{log_type}** | {p['sla_profile']} | {format_human_duration(p['p99_gap_seconds'])} | **{p['alert_window_human']}** | {p['alert_window_seconds']} | {p['latency_p95_human']} | {p['daily_avg_logs']} | {p['volume_threshold']} |")
 
 @functions_framework.http
 def main_http(request):
@@ -156,8 +238,8 @@ def main_http(request):
         return ("Missing GCP_PROJECT_ID or OUTPUT_GCS_BUCKET environment variables.", 400)
         
     try:
-        profiles = analyze_ingestion_sla(project_id)
-        write_output(profiles, "", gcs_bucket, gcs_blob_name)
+        profiles, host_profiles = analyze_ingestion_sla(project_id)
+        write_output(profiles, "", gcs_bucket, gcs_blob_name, host_profiles)
         return ("SLA Profiling completed and tfvars written to GCS.", 200)
     except Exception as e:
         return (f"Execution failed: {str(e)}", 500)
@@ -178,14 +260,14 @@ def main():
         parser.print_help()
         sys.exit(1)
         
-    profiles = analyze_ingestion_sla(project_id)
+    profiles, host_profiles = analyze_ingestion_sla(project_id)
     
     if args.dry_run:
         print_dry_run_report(profiles, args.format)
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         tf_vars_path = os.path.abspath(os.path.join(script_dir, "../terraform/terraform.tfvars.json"))
-        write_output(profiles, tf_vars_path, gcs_bucket, gcs_blob_name)
+        write_output(profiles, tf_vars_path, gcs_bucket, gcs_blob_name, host_profiles)
 
 if __name__ == "__main__":
     main()
