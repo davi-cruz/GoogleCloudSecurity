@@ -1,0 +1,27 @@
+{
+  "_comment": "Example overrides for Google SecOps Monitoring Solution. Copy to scripts/overrides.json to apply custom feed SLAs or host silence exclusions.",
+  "monitors": {
+    "GCP_CLOUDAUDIT": {
+      "alert_window_seconds": 3600,
+      "alert_window_human": "1h",
+      "sla_profile": "batch",
+      "ignore": false
+    },
+    "DEPRECATED_TEST_FEED": {
+      "ignore": true
+    }
+  },
+  "host_monitors": {
+    "dc-prod-collector-01": {
+      "host_name": "dc-prod-collector-01",
+      "alert_window_seconds": 900,
+      "alert_window_human": "15m",
+      "ignore": false
+    },
+    "ephemeral-dev-host": {
+      "host_name": "ephemeral-dev-host",
+      "ignore": true
+    }
+  }
+}
+

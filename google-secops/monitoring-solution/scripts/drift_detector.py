@@ -5,11 +5,11 @@ import sys
 import time
 from google.cloud import monitoring_v3
 
-from secops_monitoring_utils import send_soar_webhook_alert, load_json_file
+from secops_monitoring_utils import send_soar_webhook_alert, load_json_file, load_json_config
 
-def load_terraform_vars(filepath):
-    """Loads currently configured monitors from terraform.tfvars.json."""
-    data = load_json_file(filepath)
+def load_terraform_vars(filepath=None, gcs_bucket=None, gcs_blob_name=None):
+    """Loads currently configured monitors from GCS or terraform.tfvars.json."""
+    data = load_json_config(filepath=filepath, gcs_bucket=gcs_bucket, gcs_blob_name=gcs_blob_name)
     return data.get("monitors", {})
 
 def query_active_log_types(project_id):
@@ -36,7 +36,12 @@ def query_active_log_types(project_id):
     
     active_sources = {}
     for series in results:
-        labels = series.metric.labels
+        labels = {}
+        for k, v in series.resource.labels.items():
+            labels[k] = v
+        for k, v in series.metric.labels.items():
+            labels[k] = v
+            
         log_type = labels.get("log_type")
         if not log_type or log_type == "FORWARDER_HEARTBEAT":
             continue
@@ -111,10 +116,14 @@ def main():
     parser = argparse.ArgumentParser(description="Google SecOps Configuration Drift Detector.")
     parser.add_argument("project_id", nargs="?", help="The GCP Project ID to query metrics from.")
     parser.add_argument("--webhook-url", help="Optional Webhook URL to dispatch drift alerts.")
+    parser.add_argument("--gcs-bucket", help="Optional GCS Bucket to read terraform.tfvars.json from.")
+    parser.add_argument("--gcs-blob", default="terraform.tfvars.json", help="Optional GCS Blob name.")
     
     args = parser.parse_args()
-    project_id = args.project_id or os.environ.get("GCP_PROJECT_ID")
+    project_id = args.project_id or os.environ.get("BYOP_PROJECT_ID") or os.environ.get("GCP_PROJECT_ID")
     webhook_url = args.webhook_url or os.environ.get("SOAR_WEBHOOK_URL")
+    gcs_bucket = args.gcs_bucket or os.environ.get("OUTPUT_GCS_BUCKET")
+    gcs_blob = args.gcs_blob or os.environ.get("OUTPUT_GCS_BLOB", "terraform.tfvars.json")
     
     if not project_id:
         parser.print_help()
@@ -123,7 +132,7 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     tf_vars_path = os.path.abspath(os.path.join(script_dir, "../terraform/terraform.tfvars.json"))
     
-    configured = load_terraform_vars(tf_vars_path)
+    configured = load_terraform_vars(filepath=tf_vars_path, gcs_bucket=gcs_bucket, gcs_blob_name=gcs_blob)
     active = query_active_log_types(project_id)
     
     alerts = check_drift(configured, active)

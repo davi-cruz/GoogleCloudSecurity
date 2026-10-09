@@ -1,0 +1,16 @@
+# Terraform local artifacts
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime outputs and ledger
+consumption_ledger.json
+forecast_vars.json
+scripts_deployment.zip
+

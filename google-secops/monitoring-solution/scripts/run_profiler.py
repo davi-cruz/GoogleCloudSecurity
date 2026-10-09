@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import functions_framework
 from google.cloud import monitoring_v3
 
-from secops_monitoring_utils import format_human_duration, write_json_output
+from secops_monitoring_utils import format_human_duration, write_json_output, load_json_config
 
 # Default SLA Mapping rules
 # Threshold is 99% of logs arrived within:
@@ -99,8 +99,11 @@ def analyze_ingestion_sla(project_id, lookback_days=15):
             else:
                 profile = "variable"
 
-        # Calculate dynamic heartbeat window (1.5 * p99_gap clamped between 300s and 1209600s / 14 days)
-        dynamic_alert_window = max(300, min(1209600, int(p99_gap * 1.5)))
+        # Calculate dynamic heartbeat window (1.5 * p99_gap aligned to full 60s minutes)
+        # Google Cloud Monitoring condition_absent requires durations in integer multiples of 60s
+        raw_window = int(p99_gap * 1.5)
+        minute_aligned_window = max(300, int(round(raw_window / 60.0)) * 60)
+        dynamic_alert_window = minute_aligned_window
         # Override with SLA profile window if smaller for realtime feeds
         alert_window = min(SLA_PROFILES[profile]["alert_window_seconds"], dynamic_alert_window) if profile == "realtime" else dynamic_alert_window
 
@@ -186,27 +189,22 @@ def write_output(profiles, filepath, gcs_bucket=None, gcs_blob_name=None, host_p
     """Writes results locally or uploads to a GCS bucket, merging contract terms and existing tfvars."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Read existing tfvars if present to preserve user project IDs/region
-    tf_data = {}
-    if filepath and os.path.exists(filepath):
-        try:
-            with open(filepath, "r") as f:
-                tf_data = json.load(f)
-        except Exception:
-            tf_data = {}
+    # Read existing tfvars if present from GCS or disk to preserve user project IDs/region
+    tf_data = load_json_config(filepath=filepath, gcs_bucket=gcs_bucket, gcs_blob_name=gcs_blob_name)
 
     tf_data["monitors"] = profiles
     tf_data["host_monitors"] = host_profiles or {}
 
-    # Auto-serialize contract_terms.json if present
-    terms_path = os.path.join(script_dir, "contract_terms.json")
-    if os.path.exists(terms_path):
-        try:
-            with open(terms_path, "r") as f:
-                terms_data = json.load(f)
-                tf_data["contract_terms_json"] = json.dumps(terms_data)
-        except Exception as e:
-            print(f"Warning: Could not auto-serialize contract_terms.json: {e}", file=sys.stderr)
+    # Auto-serialize contract_terms.json if not already defined in tf_data
+    if "contract_terms_json" not in tf_data or not tf_data["contract_terms_json"]:
+        terms_path = os.path.join(script_dir, "contract_terms.json")
+        if os.path.exists(terms_path):
+            try:
+                with open(terms_path, "r") as f:
+                    terms_data = json.load(f)
+                    tf_data["contract_terms_json"] = json.dumps(terms_data)
+            except Exception as e:
+                print(f"Warning: Could not auto-serialize contract_terms.json: {e}", file=sys.stderr)
 
     write_json_output(tf_data, filepath, gcs_bucket, gcs_blob_name)
 

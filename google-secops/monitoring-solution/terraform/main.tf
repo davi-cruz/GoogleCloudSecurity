@@ -11,10 +11,10 @@ terraform {
     }
   }
 
-  # backend "gcs" {
-  #   bucket  = "my-company-secops-tfstate"
-  #   prefix  = "terraform/secops-monitoring/state"
-  # }
+  backend "gcs" {
+    bucket = "dc-secops-lab-tfstate"
+    prefix = "secops-monitoring"
+  }
 }
 
 # Provider configurations for project division
@@ -101,10 +101,14 @@ resource "google_service_account" "function_sa" {
   display_name = "SecOps Monitoring Service Account"
 }
 
-# Give Service Account access to read metrics in the BYOP Project
+locals {
+  all_byop_projects = distinct(compact(concat([var.byop_project_id], var.byop_project_ids)))
+}
+
+# Give Service Account access to read metrics in all BYOP Projects (Multi-Tenant Support)
 resource "google_project_iam_member" "byop_metrics_viewer" {
-  provider = google.byop
-  project  = var.byop_project_id
+  for_each = toset(local.all_byop_projects)
+  project  = each.value
   role     = "roles/monitoring.viewer"
   member   = "serviceAccount:${google_service_account.function_sa.email}"
 }
@@ -141,20 +145,39 @@ resource "google_cloudfunctions2_function" "secops_orchestrator" {
   }
 
   service_config {
-    max_instance_count = 1
-    available_memory   = "256Mi"
-    timeout_seconds    = 300
+    max_instance_count    = 1
+    available_memory      = "256Mi"
+    timeout_seconds       = 300
     service_account_email = google_service_account.function_sa.email
-    
+
     environment_variables = {
       GCP_PROJECT_ID       = var.byop_project_id
+      BYOP_PROJECT_ID      = var.byop_project_id
       OUTPUT_GCS_BUCKET    = google_storage_bucket.config_bucket.name
       OUTPUT_GCS_BLOB      = "terraform.tfvars.json"
       OUTPUT_FORECAST_BLOB = "forecast_vars.json"
       CONTRACT_TERMS_JSON  = var.contract_terms_json
-      SOAR_WEBHOOK_URL     = var.create_webhook_secret ? google_secret_manager_secret_version.soar_webhook_url_version_managed[0].secret_data : data.google_secret_manager_secret_version.soar_webhook_url_version[0].secret_data
+    }
+
+    dynamic "secret_environment_variables" {
+      for_each = var.create_webhook_secret || var.webhook_url != "" ? [1] : []
+      content {
+        key        = "SOAR_WEBHOOK_URL"
+        project_id = var.orchestration_project_id
+        secret     = var.create_webhook_secret ? google_secret_manager_secret.soar_webhook_url_managed[0].secret_id : data.google_secret_manager_secret.soar_webhook_url[0].secret_id
+        version    = "latest"
+      }
     }
   }
+}
+
+# Allow Cloud Scheduler to invoke the Cloud Run Function via function_sa OIDC token
+resource "google_cloud_run_v2_service_iam_member" "invoker" {
+  project  = var.orchestration_project_id
+  location = google_cloudfunctions2_function.secops_orchestrator.location
+  name     = google_cloudfunctions2_function.secops_orchestrator.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.function_sa.email}"
 }
 
 # ==============================================================================
@@ -174,11 +197,13 @@ resource "google_cloud_scheduler_job" "profiler_scheduler" {
     uri         = google_cloudfunctions2_function.secops_orchestrator.service_config[0].uri
     body        = base64encode("{\"action\": \"profiler\"}")
     headers     = { "Content-Type" = "application/json" }
-    
+
     oidc_token {
       service_account_email = google_service_account.function_sa.email
     }
   }
+
+  depends_on = [google_cloud_run_v2_service_iam_member.invoker]
 }
 
 # Daily Trigger for Forecast Engine (Daily at 1:00 AM)
@@ -194,11 +219,13 @@ resource "google_cloud_scheduler_job" "forecast_scheduler" {
     uri         = google_cloudfunctions2_function.secops_orchestrator.service_config[0].uri
     body        = base64encode("{\"action\": \"forecast\"}")
     headers     = { "Content-Type" = "application/json" }
-    
+
     oidc_token {
       service_account_email = google_service_account.function_sa.email
     }
   }
+
+  depends_on = [google_cloud_run_v2_service_iam_member.invoker]
 }
 
 # Daily Trigger for Configuration Drift Detector (Daily at 2:00 AM)
@@ -214,11 +241,13 @@ resource "google_cloud_scheduler_job" "drift_scheduler" {
     uri         = google_cloudfunctions2_function.secops_orchestrator.service_config[0].uri
     body        = base64encode("{\"action\": \"drift\"}")
     headers     = { "Content-Type" = "application/json" }
-    
+
     oidc_token {
       service_account_email = google_service_account.function_sa.email
     }
   }
+
+  depends_on = [google_cloud_run_v2_service_iam_member.invoker]
 }
 
 # ==============================================================================
@@ -245,9 +274,11 @@ resource "google_monitoring_notification_channel" "soar_webhook" {
 # ------------------------------------------------------------------------------
 
 # Dynamic Alert Policies per Log Feed (Metric Absence alerts matching SLA)
+# Note: Google Cloud Monitoring condition_absent enforces a max duration of 23h30m (84600s) and full minute multiples.
+# Feeds with gap > 84600s are low-frequency / variable feeds where continuous absence alerting creates false positives.
 resource "google_monitoring_alert_policy" "log_feed_absence" {
   provider     = google.byop
-  for_each     = var.monitors
+  for_each     = { for k, v in var.monitors : k => v if !lookup(v, "ignore", false) && v.alert_window_seconds <= 84600 }
   display_name = "[Ingestion] SecOps Log Ingestion Absence - ${each.value.log_type}"
   combiner     = "OR"
 
@@ -255,70 +286,70 @@ resource "google_monitoring_alert_policy" "log_feed_absence" {
     display_name = "No records seen for ${each.value.log_type}"
     condition_absent {
       filter   = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/record_count\" AND resource.labels.log_type = \"${each.value.log_type}\""
-      duration = "${each.value.alert_window_seconds}s"
-      
+      duration = "${floor(min(84600, max(300, each.value.alert_window_seconds)) / 60) * 60}s"
+
       trigger {
         count = 1
       }
-      
+
       aggregations {
         alignment_period     = "300s"
         per_series_aligner   = "ALIGN_SUM"
         cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "resource.labels.log_type"]
+        group_by_fields      = ["project", "resource.labels.log_type"]
       }
     }
   }
 
   notification_channels = [google_monitoring_notification_channel.soar_webhook.name]
-  
+
   documentation {
     content   = "Log feed `${each.value.log_type}` went silent for more than its dynamic SLA of ${coalesce(each.value.alert_window_human, "${each.value.alert_window_seconds}s")}. Please verify feed and collector health. Reference: SOP-SILENT-SOURCE."
     mime_type = "text/markdown"
   }
-  
+
   user_labels = {
     category = "ingestion"
     severity = "high"
-    log_type = each.value.log_type
+    log_type = lower(replace(each.value.log_type, "_", "-"))
   }
 }
 
-# Alert Policy for Ingestion P95 Latency Surge
-resource "google_monitoring_alert_policy" "ingestion_latency_p95" {
+# Alert Policy for Ingestion Volume Anomaly / Rate Dip
+resource "google_monitoring_alert_policy" "ingestion_volume_anomaly" {
   provider     = google.byop
-  for_each     = var.monitors
-  display_name = "[Ingestion] SecOps P95 Ingestion Latency Surge - ${each.value.log_type}"
+  for_each     = { for k, v in var.monitors : k => v if !lookup(v, "ignore", false) && v.volume_threshold > 0 }
+  display_name = "[Ingestion] SecOps Ingestion Volume Dip Anomaly - ${each.value.log_type}"
   combiner     = "OR"
 
   conditions {
-    display_name = "P95 Ingestion latency exceeds threshold for ${each.value.log_type}"
+    display_name = "Ingestion volume dip below threshold for ${each.value.log_type}"
     condition_threshold {
       filter          = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/record_count\" AND resource.labels.log_type = \"${each.value.log_type}\""
-      comparison      = "COMPARISON_GT"
-      threshold_value = 1800 # 30 minutes threshold
-      duration        = "900s"
+      comparison      = "COMPARISON_LT"
+      threshold_value = each.value.volume_threshold
+      duration        = "3600s"
 
       aggregations {
-        alignment_period     = "300s"
-        per_series_aligner   = "ALIGN_DELTA"
+        alignment_period     = "3600s"
+        per_series_aligner   = "ALIGN_SUM"
         cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "resource.labels.log_type"]
+        group_by_fields      = ["project", "resource.labels.log_type"]
       }
     }
   }
 
   notification_channels = [google_monitoring_notification_channel.soar_webhook.name]
-  
+
   documentation {
-    content   = "Ingestion P95 latency for `${each.value.log_type}` exceeded 30 minutes. Late arriving logs impact YARA-L rule detection windows. Reference: SOP-INGESTION-LATENCY."
+    content   = "Ingestion volume for `${each.value.log_type}` dropped below the dynamic baseline threshold (${each.value.volume_threshold} logs/hr). Potential upstream collector drop or pipeline blockage. Detailed event-to-ingested latency must be reviewed in Google SecOps Health Hub. Reference: SOP-INGESTION-ANOMALY."
     mime_type = "text/markdown"
   }
-  
+
   user_labels = {
     category = "ingestion"
     severity = "medium"
-    log_type = each.value.log_type
+    log_type = lower(replace(each.value.log_type, "_", "-"))
   }
 }
 
@@ -333,27 +364,27 @@ resource "google_monitoring_alert_policy" "bindplane_agent_outage" {
     condition_absent {
       filter   = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/agent/exporter_accepted_spans_count\""
       duration = "3600s"
-      
+
       trigger {
         count = 1
       }
-      
+
       aggregations {
         alignment_period     = "300s"
         per_series_aligner   = "ALIGN_MEAN"
         cross_series_reducer = "REDUCE_MEAN"
-        group_by_fields      = ["project_id", "resource.labels.collector_id"]
+        group_by_fields      = ["project", "resource.labels.collector_id"]
       }
     }
   }
 
   notification_channels = [google_monitoring_notification_channel.soar_webhook.name]
-  
+
   documentation {
     content   = "BindPlane Collection Agent has stopped emitting metrics. The collector may be offline or experiencing local buffer overflows. Reference: SOP-COLLECTOR-OUTAGE."
     mime_type = "text/markdown"
   }
-  
+
   user_labels = {
     category = "ingestion"
     severity = "critical"
@@ -361,42 +392,43 @@ resource "google_monitoring_alert_policy" "bindplane_agent_outage" {
 }
 
 # Dynamic Alert Policy for Silent Endpoint Hosts (ignoring hosts marked with ignore = true)
+# Note: Google Cloud Monitoring condition_absent enforces a max duration of 23h30m (84600s) and full minute multiples.
 resource "google_monitoring_alert_policy" "silent_host" {
   provider     = google.byop
-  for_each     = { for k, v in var.host_monitors : k => v if !lookup(v, "ignore", false) }
+  for_each     = { for k, v in var.host_monitors : k => v if !lookup(v, "ignore", false) && v.alert_window_seconds <= 84600 }
   display_name = "[Ingestion] SecOps Silent Endpoint Host - ${each.value.host_name}"
   combiner     = "OR"
 
   conditions {
     display_name = "No records received from host ${each.value.host_name}"
     condition_absent {
-      filter   = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/record_count\" AND metric.labels.host = \"${each.value.host_name}\""
-      duration = "${each.value.alert_window_seconds}s"
-      
+      filter   = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/record_count\" AND metric.labels.ingestion_source = \"${each.value.host_name}\""
+      duration = "${floor(min(84600, max(300, each.value.alert_window_seconds)) / 60) * 60}s"
+
       trigger {
         count = 1
       }
-      
+
       aggregations {
         alignment_period     = "300s"
         per_series_aligner   = "ALIGN_SUM"
         cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "metric.labels.host"]
+        group_by_fields      = ["project", "metric.labels.ingestion_source"]
       }
     }
   }
 
   notification_channels = [google_monitoring_notification_channel.soar_webhook.name]
-  
+
   documentation {
     content   = "Endpoint host `${each.value.host_name}` went silent for more than ${coalesce(each.value.alert_window_human, "${each.value.alert_window_seconds}s")}. Verify agent daemon and network status on host. Reference: SOP-SILENT-HOST."
     mime_type = "text/markdown"
   }
-  
+
   user_labels = {
     category = "ingestion"
     severity = "high"
-    host     = each.value.host_name
+    host     = lower(replace(each.value.host_name, "_", "-"))
   }
 }
 
@@ -412,28 +444,31 @@ resource "google_monitoring_alert_policy" "parser_degradation" {
 
   conditions {
     display_name = "Parser failure ratio > 5% on parsed logs"
-    condition_threshold {
-      filter          = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/normalizer/log/record_count\""
-      comparison      = "COMPARISON_GT"
-      threshold_value = 0.05
-      duration        = "900s"
-      
-      aggregations {
-        alignment_period     = "300s"
-        per_series_aligner   = "ALIGN_SUM"
-        cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "resource.labels.log_type"]
+    condition_monitoring_query_language {
+      query    = <<-EOT
+        fetch chronicle.googleapis.com/Collector
+        | { metric 'chronicle.googleapis.com/normalizer/log/record_count'
+            | filter metric.state == 'failed_parsing'
+            | group_by [resource.project_id, resource.log_type], 15m, sum(val())
+          ; metric 'chronicle.googleapis.com/normalizer/log/record_count'
+            | group_by [resource.project_id, resource.log_type], 15m, sum(val()) }
+        | ratio
+        | condition val() > 0.05
+      EOT
+      duration = "0s"
+      trigger {
+        count = 1
       }
     }
   }
 
   notification_channels = [google_monitoring_notification_channel.soar_webhook.name]
-  
+
   documentation {
     content   = "Parser failure ratio exceeds 5% in the last 15 minutes. This suggests a parser layout shift or broken format structure in parsed logs. Reference: SOP-PARSER-DEGRADATION."
     mime_type = "text/markdown"
   }
-  
+
   user_labels = {
     category = "parsing"
     severity = "high"
@@ -458,7 +493,7 @@ resource "google_monitoring_alert_policy" "unspecified_log_growth" {
         alignment_period     = "300s"
         per_series_aligner   = "ALIGN_SUM"
         cross_series_reducer = "REDUCE_SUM"
-        group_by_fields      = ["project_id", "resource.labels.log_type"]
+        group_by_fields      = ["project", "resource.labels.log_type"]
       }
     }
   }
@@ -480,26 +515,39 @@ resource "google_monitoring_alert_policy" "unspecified_log_growth" {
 # CATEGORY 3: BILLING ALERTS
 # ------------------------------------------------------------------------------
 
-# Alert Policy for Ingestion Quota Reaching Capacity
-resource "google_monitoring_alert_policy" "ingestion_quota_warning" {
+# Alert Policy for Ingestion Quota Rejection / Dropped Logs
+resource "google_monitoring_alert_policy" "ingestion_quota_rejection" {
   provider     = google.byop
-  display_name = "[Billing] SecOps Ingestion Quota Approaching Limit"
+  display_name = "[Billing] SecOps Ingestion Quota Rejection / Dropped Logs"
   combiner     = "OR"
 
   conditions {
-    display_name = "Ingestion rate is above 80% of configured daily quota"
-    condition_matched_log {
-      filter = "resource.type = \"chronicle.googleapis.com/Collector\""
+    display_name = "SecOps ingestion quota exceeded (quota_rejected_bytes_count > 0)"
+    condition_threshold {
+      filter          = "resource.type = \"chronicle.googleapis.com/Collector\" AND metric.type = \"chronicle.googleapis.com/ingestion/log/quota_rejected_bytes_count\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_SUM"
+      }
+
+      trigger {
+        count = 1
+      }
     }
   }
 
   notification_channels = [google_monitoring_notification_channel.soar_webhook.name]
-  
+
   documentation {
-    content   = "Daily ingestion has reached 80% of total contracted license quota. Overage billing charges will apply soon if ingestion trajectory continues. Reference: SOP-QUOTA-MANAGEMENT."
+    content   = "Ingestion logs are actively being dropped due to quota limit exhaustion (`quota_rejected_bytes_count > 0`). Immediate license expansion or collection rate limiting required. Proactive 80% consumption pacing is tracked by the daily forecast engine. Reference: SOP-QUOTA-MANAGEMENT."
     mime_type = "text/markdown"
   }
-  
+
   user_labels = {
     category = "billing"
     severity = "critical"

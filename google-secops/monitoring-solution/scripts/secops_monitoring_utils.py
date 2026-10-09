@@ -14,8 +14,15 @@ from google.cloud import storage
 
 def format_human_duration(seconds):
     """Converts seconds into a human readable string like '6h 18m' or '5m' or '2d 4h'."""
-    if not seconds or seconds < 60:
-        return f"{seconds}s"
+    if seconds is None:
+        return "0s"
+    try:
+        seconds = int(seconds)
+    except (ValueError, TypeError):
+        return "0s"
+        
+    if seconds < 60:
+        return f"{max(0, seconds)}s"
     
     minutes = seconds // 60
     hours = minutes // 60
@@ -60,9 +67,12 @@ def send_soar_webhook_alert(webhook_url, project_id, event_type, source_rule, me
         req = urllib.request.Request(
             webhook_url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Google-SecOps-Monitoring/1.0"
+            }
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             print(f"SOAR Webhook alert [{event_type}] successfully dispatched (HTTP {resp.status})", file=sys.stderr)
             return True
     except Exception as e:
@@ -71,7 +81,7 @@ def send_soar_webhook_alert(webhook_url, project_id, event_type, source_rule, me
 
 def load_json_file(filepath):
     """Safely loads a JSON file from disk."""
-    if not os.path.exists(filepath):
+    if not filepath or not os.path.exists(filepath):
         print(f"Error: File '{filepath}' not found.", file=sys.stderr)
         return {}
     with open(filepath, "r") as f:
@@ -80,6 +90,26 @@ def load_json_file(filepath):
         except json.JSONDecodeError as e:
             print(f"Error decoding JSON file '{filepath}': {e}", file=sys.stderr)
             return {}
+
+def load_json_config(filepath=None, gcs_bucket=None, gcs_blob_name=None):
+    """Safely loads a JSON configuration from GCS or disk with fallback."""
+    if gcs_bucket and gcs_blob_name:
+        try:
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(gcs_bucket)
+            blob = bucket.blob(gcs_blob_name)
+            if blob.exists():
+                content = blob.download_as_text()
+                return json.loads(content)
+            else:
+                print(f"Notice: GCS Blob '{gcs_blob_name}' does not exist in bucket '{gcs_bucket}'.", file=sys.stderr)
+        except Exception as e:
+            print(f"Warning: Failed to load JSON config from GCS '{gcs_bucket}/{gcs_blob_name}': {e}", file=sys.stderr)
+
+    if filepath and os.path.exists(filepath):
+        return load_json_file(filepath)
+
+    return {}
 
 def write_json_output(data, filepath, gcs_bucket=None, gcs_blob_name=None):
     """Writes data as formatted JSON locally or uploads directly to a GCS bucket."""
@@ -92,8 +122,17 @@ def write_json_output(data, filepath, gcs_bucket=None, gcs_blob_name=None):
         blob = bucket.blob(gcs_blob_name)
         blob.upload_from_string(json_content, content_type="application/json")
         print("GCS Upload successful.", file=sys.stderr)
-    else:
+    elif filepath:
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         with open(filepath, "w") as f:
             f.write(json_content)
         print(f"Successfully saved output locally to: {filepath}", file=sys.stderr)
+
+def write_preserving_config(updates, filepath=None, gcs_bucket=None, gcs_blob_name=None):
+    """Loads existing config from GCS or local file, merges top-level updates, and writes back."""
+    existing_data = load_json_config(filepath=filepath, gcs_bucket=gcs_bucket, gcs_blob_name=gcs_blob_name)
+    existing_data.update(updates)
+    target_filepath = filepath or "terraform.tfvars.json"
+    write_json_output(existing_data, target_filepath, gcs_bucket=gcs_bucket, gcs_blob_name=gcs_blob_name)
+    return existing_data
+

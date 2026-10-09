@@ -9,19 +9,21 @@ This solution is designed to alert on ingestion pipeline outages, track parsed e
 ## 📂 Directory Structure
 ```
 /monitoring-solution/
-├── README.md                    <- Comprehensive deployment & adoption guide
+├── README.md                      <- Comprehensive deployment & adoption guide
+├── .gitignore                     <- Git ignore rules for state files, venvs, and ledgers
 ├── scripts/
-│   ├── main.py                  <- Unified Cloud Run Function HTTP entrypoint
+│   ├── main.py                    <- Unified Cloud Run Function HTTP entrypoint
 │   ├── secops_monitoring_utils.py <- Shared utilities module (SOAR Webhook POST, duration format, GCS I/O)
-│   ├── run_profiler.py          <- SLA Ingestion Profiler & P99 arrival gap engine
-│   ├── drift_detector.py        <- Configuration Drift Detector & CATCH_ALL route monitor
-│   ├── forecast_engine.py       <- Multi-term contract consumption forecast engine
-│   ├── contract_terms.json      <- Multi-term contract schedule configuration
-│   └── requirements.txt         <- Dependencies for the Python engine
+│   ├── run_profiler.py            <- SLA Ingestion Profiler & P99 arrival gap engine
+│   ├── drift_detector.py          <- Configuration Drift Detector & CATCH_ALL route monitor
+│   ├── forecast_engine.py         <- Multi-term contract consumption forecast engine
+│   ├── contract_terms.json        <- Multi-term contract schedule configuration
+│   ├── overrides.json.example     <- Reference template for manual SLA & host monitor overrides
+│   └── requirements.txt           <- Dependencies for the Python engine
 └── terraform/
-    ├── main.tf                  <- IaC deploying BYOP alert policies & single Orchestration Function
-    ├── variables.tf             <- Alert and infrastructure variable definitions
-    └── terraform.tfvars.json    <- Configured parameter values (project IDs, SLA monitors, contract terms)
+    ├── main.tf                    <- IaC deploying BYOP alert policies, remote GCS backend & Orchestrator
+    ├── variables.tf               <- Alert and infrastructure variable definitions
+    └── terraform.tfvars.json      <- Configured parameter values (project IDs, SLA monitors, contract terms)
 ```
 
 ---
@@ -73,6 +75,7 @@ This solution leverages Google Cloud's dedicated telemetry platform (**Google Cl
 2. **Action Dispatch via HTTP Payload**: Cloud Scheduler jobs pass a lightweight JSON payload (`{"action": "profiler"}`, `{"action": "forecast"}`, `{"action": "drift"}`) to trigger specific tasks.
 3. **SOAR Webhook Integration**: Both engine-level alerts (contract overage, configuration drift) and infrastructure-level alerts (metric absence, latency surge) post SOAR-formatted JSON payloads directly to the **SecOps SOAR Alert Queue**.
 4. **Human-Readable Alert Telemetry**: Alert policy documentations and profiler outputs automatically convert raw seconds into clear human-readable magnitudes (e.g. `6h 18m`, `5m`, `30m`).
+5. **Secure Scheduler Invocations via OIDC**: Cloud Scheduler securely invokes the Cloud Run Function Gen 2 using Google-signed OIDC tokens with the dedicated service account (`secops-monitoring-sa`). Terraform binds `roles/run.invoker` on the underlying Cloud Run service to prevent HTTP 403 Forbidden errors.
 
 ---
 
@@ -90,25 +93,53 @@ The solution categorizes all alerts into 3 core operational domains:
 
 ### 1. Ingestion Category
 1. **Log Ingestion Absence (Per Source)**: Triggers when no log records are ingested for a source (e.g., `WINDOWS_DNS`) for longer than its dynamic P99 arrival SLA window.
-2. **P95 Ingestion Latency Surge**: Alerts when P95 ingestion latency exceeds 30 minutes (or $3\times$ baseline), identifying delayed ingestion pipelines that compromise YARA-L detection rule windows.
-3. **Silent Endpoint Host**: Alerts if a specific server host ceases sending logs while the gateway agent remains online.
-4. **Bindplane Agent / Feed Outage**: Alerts when a collection agent daemon fails or loses connectivity.
-5. **Log Spike & Log Dip**: MQL ratio policies detecting sudden surges ($>200\%$) or drops ($>70\%$) relative to historical baselines.
+2. **Ingestion Volume Dip Anomaly**: Alerts when hourly ingestion volume drops below baseline threshold (`volume_threshold`), identifying pipeline drops or upstream collector failures. (Note: Event-to-ingested timestamp delta analysis is natively monitored in the Google SecOps Health Hub).
+3. **Silent Endpoint Host**: Alerts if a specific server host (`metric.labels.ingestion_source`) ceases sending logs while the gateway agent remains online.
+4. **Bindplane Agent / Feed Outage**: Alerts when a collection agent daemon fails or loses connectivity (`exporter_accepted_spans_count`).
 
 ### 2. Parsing Category
-1. **Parser/Normalization Degradation**: Alerts if parsing error ratio rises to $\ge 5\%$ over a 15-minute window, identifying vendor format shifts or broken parsers.
+1. **Parser/Normalization Degradation (MQL Ratio)**: Evaluates the exact ratio of `failed_parsing` records against total normalized records via Cloud Monitoring Query Language (MQL). Alerts if normalization failure ratio exceeds $\ge 5\%$ over a 15-minute window.
 2. **Catch-All Growth Warning**: Alerts when `CATCH_ALL` (or `UNSPECIFIED_LOG_TYPE`) volume surges, indicating unmapped Bindplane feeds or missing parser assignments.
 
 ### 3. Billing Category
-1. **Ingestion Quota Approaching Limit**: Alerts when consumption rates reach $80\%$ of daily capacity.
-2. **Contract Consumption Overage Forecast**: `forecast_engine.py` aggregates multi-term contract consumption velocity and dispatches Webhook alerts when projected end-of-term volume exceeds license commitments.
+1. **Ingestion Quota Rejection / Dropped Logs**: Alerts immediately when Google SecOps drops or throttles logs due to quota exhaustion (`quota_rejected_bytes_count > 0`).
+2. **Contract Consumption Overage Forecast**: `forecast_engine.py` evaluates ingestion velocity over a rolling 30-day window and maintains a persistent GCS ledger, dispatching Webhook alerts when projected end-of-term volume exceeds license commitments.
+3. **Multi-Tenant Fair-Share & Quota Proportion Monitoring**: When multiple Google SecOps instances (tenants) are billed to a single master billing account, `forecast_engine.py` monitors each tenant's consumption against their contracted percentage share (e.g. 70% to Main Tenant, 30% to Secondary Tenant), detecting unfair quota proportion drift ($\ge 10\%$ deviation) and forecasting tenant-specific overages.
 
 ---
 
-## 4. Ingestion Trends & Dashboards
+### Technical Guardrails & False-Positive Elimination
 
-> [!NOTE]
-> **Coming Soon**: This section will contain recommended native Google SecOps ingestion health and log monitoring dashboard visualizations.
+To ensure high-fidelity alerting without operational noise, the solution enforces several Google Cloud Monitoring API requirements natively in both the profiler scripts and Terraform configurations:
+* **Absence Duration Clamping (Max 23h 30m / 84,600s)**: Google Cloud Monitoring's `condition_absent` API enforces an absolute maximum duration limit of 23 hours and 30 minutes. Sparse or event-driven context feeds (such as periodic IAM snapshots or rare threat findings) naturally go days between events. The solution automatically excludes feeds with gap $> 23\text{h }30\text{m}$ from continuous absence alerting, avoiding daily false alarms while retaining volume anomaly baselines and configuration drift detection.
+* **Minute-Aligned Durations**: Cloud Monitoring rejects absence durations with sub-minute granularity. The profiler rounds all calculated heartbeat windows to integer multiples of 60 seconds (`1m`).
+* **Standards-Compliant Aggregation Grouping**: Aggregation group-by fields use the Cloud Monitoring resource convention `["project", "resource.labels.log_type"]`.
+* **RFC-Compliant Lowercase User Labels**: In accordance with Google Cloud Monitoring AlertPolicy schema regex (`[\p{Ll}\p{Lo}\p{N}_-]{0,63}`), all alert user labels are sanitized to lowercase (e.g. `log_type = lower(replace(each.value.log_type, "_", "-"))`).
+
+---
+
+## 4. Multi-Tenant Ingestion & Quota Proportion Architecture
+
+Because Google SecOps mandates a **single instance per Google Cloud Project**, multi-tenant enterprise and MSSP deployments allocate multiple distinct BYOP projects (`secops-gaia`, `secops-gaia-ent`) under a **single master Google Cloud Billing Account**.
+
+In this scenario, customers allocate a contracted percentage of the overall ingestion quota to each tenant (e.g., 70% to Main Tenant, 30% to Secondary Tenant). The solution automatically validates fair-share consumption, tracks proportion skew, and alerts before overages occur.
+
+### Mathematical Modeling & Fair-Share Formulas
+
+For each tenant $i$ under active contract term $T$:
+1. **Allocated Quota**:
+   $$\text{AllocatedQuotaGB}_i = \text{CommittedGB}_{\text{total}} \times \left( \frac{\text{QuotaSharePct}_i}{100} \right)$$
+2. **Actual Ingestion Share %**:
+   $$\text{ActualSharePct}_i = \left( \frac{\text{CumulativeGB}_i}{\sum_j \text{CumulativeGB}_j} \right) \times 100$$
+3. **Proportion Deviation**:
+   $$\Delta \text{SharePct}_i = \text{ActualSharePct}_i - \text{QuotaSharePct}_i$$
+4. **Projected Term-End Volume & Overage**:
+   $$\text{ProjectedTotalGB}_i = \text{CumulativeGB}_i + (\text{AvgDailyRateGB}_i \times \text{DaysRemaining})$$
+   $$\text{ProjectedOverageGB}_i = \max(0, \text{ProjectedTotalGB}_i - \text{AllocatedQuotaGB}_i)$$
+
+### Dual-Tier Alerting Strategy
+* **Critical Alert (`Tenant Ingestion Quota Overage Warning`)**: Triggered when a tenant is projected to blow past their allocated GB volume ($\text{ProjectedOverageGB}_i > 0$).
+* **Warning Alert (`Tenant Consumption Proportion Drift Warning`)**: Triggered when a tenant's actual consumption proportion drifts by $\ge +10\%$ above contracted fair-share ($\Delta \text{SharePct}_i \ge +10.0\%$), giving operators early notice to tune ingestion filters or rebalance commitments before the master contract is depleted.
 
 ---
 
@@ -213,31 +244,57 @@ gcloud services enable \
 ---
 
 ### Step 5: Configure Contract Terms, Overrides & Project IDs
-1. **Contract Terms Schedule**: Edit `scripts/contract_terms.json` to define your 1-year or multi-year terms schedule. This is the single source of truth for contract commitments.
+1. **Contract Terms Schedule & Multi-Tenant Allocation**: Edit `scripts/contract_terms.json` to define your commitments and tenant percentage quotas:
+   ```json
+   [
+     {
+       "start_date": "2026-01-01T00:00:00Z",
+       "end_date": "2026-12-31T23:59:59Z",
+       "committed_gb": 10000.0,
+       "tenants": [
+         {
+           "tenant_id": "tenant-main",
+           "name": "Main Tenant",
+           "byop_project_id": "secops-gaia",
+           "quota_share_pct": 70.0
+         },
+         {
+           "tenant_id": "tenant-secondary",
+           "name": "Secondary Tenant",
+           "byop_project_id": "secops-gaia-ent",
+           "quota_share_pct": 30.0
+         }
+       ]
+     }
+   ]
+   ```
 2. **Manual SLA & Host Overrides**: Define any custom feed or silent host overrides in `scripts/overrides.json`.
-3. **Project IDs Configuration**: Edit `terraform/terraform.tfvars.json` to specify your project IDs and region:
+3. **Project IDs Configuration**: Edit `terraform/terraform.tfvars.json` to specify your orchestration project, primary BYOP project, and all tenant BYOP project IDs:
    ```json
    {
-     "byop_project_id": "<YOUR_BYOP_PROJECT_ID>",
+     "byop_project_id": "secops-gaia",
+     "byop_project_ids": ["secops-gaia-ent"],
      "orchestration_project_id": "<YOUR_ORCHESTRATION_PROJECT_ID>",
      "region": "us-central1"
    }
    ```
    > [!TIP]
-   > You **do not** need to manually format or serialize JSON strings inside `terraform.tfvars.json`. The profiler script automatically reads `scripts/contract_terms.json` and injects the serialized `contract_terms_json` string into `terraform.tfvars.json` during execution!
+   > You **do not** need to manually format or serialize JSON strings inside `terraform.tfvars.json`. The profiler script automatically reads `scripts/contract_terms.json` and injects the serialized `contract_terms_json` string into `terraform.tfvars.json` during execution! Terraform automatically iterates over `byop_project_ids` to bind `roles/monitoring.viewer` permissions across all tenant projects for the orchestrator service account.
 
 ---
 
 ### Step 6: Initial SLA Profiling & Configuration Generation Run
-Execute `run_profiler.py` to query metrics, apply overrides, auto-serialize contract terms, and populate `terraform.tfvars.json`:
+Before applying Terraform, execute `run_profiler.py` to query metrics from your BYOP project, calculate dynamic SLAs, apply any overrides, auto-serialize contract terms, and populate `terraform/terraform.tfvars.json`:
 
 ```bash
 cd google-secops/monitoring-solution/scripts
 
-# Activate Virtual Environment
+# Create and activate virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 
-# Generate and populate terraform.tfvars.json
+# Query live metrics and generate terraform.tfvars.json
 python3 run_profiler.py <YOUR_BYOP_PROJECT_ID>
 ```
 
@@ -249,17 +306,34 @@ Deploy alerting policies and serverless schedulers to Google Cloud:
 ```bash
 cd ../terraform
 
-# Initialize Terraform plugins
+# 1. Configure your remote GCS backend in main.tf:
+# terraform {
+#   backend "gcs" {
+#     bucket = "<YOUR_TF_STATE_BUCKET>"
+#     prefix = "secops-monitoring"
+#   }
+# }
+
+# 2. Initialize Terraform with the remote backend
 terraform init
 
-# Validate configuration syntax
+# 3. Validate configuration syntax
 terraform validate
 
-# Review execution plan
-terraform plan -var-file="terraform.tfvars.json"
+# 4. Review execution plan
+terraform plan
 
-# Apply changes
-terraform apply -var-file="terraform.tfvars.json" -auto-approve
+# 5. Apply deployment
+terraform apply -auto-approve
+```
+
+---
+
+### Step 8: Upload Baseline Configuration to GCS
+Once Terraform completes, upload the generated `terraform.tfvars.json` to the GCS configuration bucket. The daily configuration drift detector references this file as the baseline to detect new or silent log sources:
+
+```bash
+gcloud storage cp terraform.tfvars.json gs://<YOUR_ORCHESTRATION_PROJECT_ID>-secops-configs/terraform.tfvars.json
 ```
 
 ---
@@ -296,8 +370,8 @@ To prevent concurrent state modifications and secure your state history, use a r
 ```hcl
 terraform {
   backend "gcs" {
-    bucket  = "my-company-secops-tfstate"
-    prefix  = "terraform/secops-monitoring/state"
+    bucket  = "<YOUR_TF_STATE_BUCKET>"
+    prefix  = "secops-monitoring"
   }
 }
 ```
@@ -379,9 +453,52 @@ python3 drift_detector.py <YOUR_BYOP_PROJECT_ID> \
 
 ---
 
-### 2. Terraform Deployment Validation
+### 2. Post-Deployment GCP Verification & Health Checks
 
-After completing dry-run checks and generating `terraform.tfvars.json`, validate and apply your deployment following **Step 7** in the Deployment Guide above.
+Once deployed, verify that all Cloud Run functions, schedulers, and alert policies are active and responding properly using the Google Cloud CLI (`gcloud`):
+
+#### 1. Verify Cloud Run Function State & Endpoint
+```bash
+gcloud functions describe secops-monitoring-orchestrator \
+  --project=<YOUR_ORCHESTRATION_PROJECT_ID> \
+  --gen2 \
+  --region=us-central1 \
+  --format="yaml(state, serviceConfig.uri, serviceConfig.serviceAccountEmail)"
+```
+*Expected Output: `state: ACTIVE` with the assigned service account `secops-monitoring-sa@...`*
+
+#### 2. Verify Cloud Scheduler Cron Triggers
+```bash
+gcloud scheduler jobs list \
+  --project=<YOUR_ORCHESTRATION_PROJECT_ID> \
+  --location=us-central1
+```
+*Expected Output: All three jobs (`secops-drift-daily-trigger`, `secops-forecast-daily-trigger`, `secops-profiler-weekly-trigger`) in `ENABLED` state.*
+
+#### 3. Verify Alert Policies in BYOP Project
+```bash
+gcloud monitoring policies list \
+  --project=<YOUR_BYOP_PROJECT_ID> \
+  --filter="displayName:SecOps" \
+  --format="table(displayName, enabled)"
+```
+*Expected Output: All absence, volume anomaly, parser degradation, and quota policies listed with `ENABLED: True`.*
+
+#### 4. Trigger an End-to-End Test Run & Inspect Logs
+Test the Cloud Scheduler OIDC authentication and Cloud Run orchestrator dispatch:
+```bash
+# 1. Manually trigger the drift scheduler job
+gcloud scheduler jobs run secops-drift-daily-trigger \
+  --project=<YOUR_ORCHESTRATION_PROJECT_ID> \
+  --location=us-central1
+
+# 2. Tail the orchestrator logs to confirm HTTP 200 execution and SOAR dispatch
+gcloud functions logs read secops-monitoring-orchestrator \
+  --project=<YOUR_ORCHESTRATION_PROJECT_ID> \
+  --gen2 \
+  --region=us-central1 \
+  --limit=15
+```
 
 ---
 

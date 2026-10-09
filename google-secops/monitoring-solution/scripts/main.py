@@ -28,12 +28,12 @@ def main_http(request):
     request_json = request.get_json(silent=True) or {}
     action = request_json.get("action", os.environ.get("DEFAULT_ACTION", "profiler")).lower()
     
-    project_id = request_json.get("project_id") or os.environ.get("GCP_PROJECT_ID")
+    project_id = request_json.get("project_id") or os.environ.get("BYOP_PROJECT_ID") or os.environ.get("GCP_PROJECT_ID")
     gcs_bucket = os.environ.get("OUTPUT_GCS_BUCKET")
     webhook_url = request_json.get("webhook_url") or os.environ.get("SOAR_WEBHOOK_URL")
     
     if not project_id:
-        return ("Missing GCP_PROJECT_ID in request body or environment.", 400)
+        return ("Missing BYOP_PROJECT_ID / GCP_PROJECT_ID in request body or environment.", 400)
 
     try:
         if action == "profiler":
@@ -53,16 +53,17 @@ def main_http(request):
             active_term, start_dt, end_dt, _ = find_active_term(terms)
             if not active_term:
                 return ("No active contract term configuration found for current date.", 400)
-            report = calculate_forecast(project_id, active_term, start_dt, end_dt)
+            report = calculate_forecast(project_id, active_term, start_dt, end_dt, gcs_bucket=gcs_bucket, ledger_blob_name="consumption_ledger.json")
             write_forecast_report(report, "", gcs_bucket, gcs_blob_name)
             if webhook_url:
                 send_forecast_alert(report, webhook_url, project_id)
             return (json.dumps({"status": "success", "action": "forecast", "report": report}), 200, {"Content-Type": "application/json"})
 
         elif action == "drift":
+            gcs_blob_name = os.environ.get("OUTPUT_GCS_BLOB", "terraform.tfvars.json")
             script_dir = os.path.dirname(os.path.abspath(__file__))
             tf_vars_path = os.path.abspath(os.path.join(script_dir, "../terraform/terraform.tfvars.json"))
-            configured = load_terraform_vars(tf_vars_path)
+            configured = load_terraform_vars(filepath=tf_vars_path, gcs_bucket=gcs_bucket, gcs_blob_name=gcs_blob_name)
             active = query_active_log_types(project_id)
             alerts = check_drift(configured, active)
             if alerts and webhook_url:
